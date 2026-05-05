@@ -1,7 +1,10 @@
 import os
 import json
 from llm import chat_completion
-from tools import BashTool, ReadFileTool, WriteFileTool, ListFilesTool
+from tools import (
+    BashTool, ReadFileTool, WriteFileTool, ListFilesTool,
+    RollDiceTool, FortuneTool, EightBallTool, RandomTopicTool, RandomPickTool,
+)
 from memory import compress_messages, estimate_messages_tokens, make_summarizer
 from config import MAX_TURNS, COMPRESS_THRESHOLD, QQ_BOT_NAME
 
@@ -93,6 +96,11 @@ class Agent:
                 SafeListFilesTool(workspace_dir),
                 SafeReadFileTool(workspace_dir),
                 SafeWriteFileTool(workspace_dir),
+                RollDiceTool(),
+                FortuneTool(),
+                EightBallTool(),
+                RandomTopicTool(),
+                RandomPickTool(),
             ]
             system_prompt = QQ_SYSTEM_PROMPT.format(name=QQ_BOT_NAME)
         else:
@@ -101,6 +109,11 @@ class Agent:
                 ReadFileTool(),
                 WriteFileTool(),
                 ListFilesTool(),
+                RollDiceTool(),
+                FortuneTool(),
+                EightBallTool(),
+                RandomTopicTool(),
+                RandomPickTool(),
             ]
             system_prompt = SYSTEM_PROMPT
 
