@@ -60,10 +60,12 @@ def handle_group_message(
         print(f"  原始: {json.dumps(raw_event, ensure_ascii=False)[:500]}")
 
     if not text and not adapter.is_at_bot(raw_event):
+        print(f"[Bot] 跳过消息 — 无文本且未@bot (user_id={user_id})")
         return
 
     # 检查是否触发
     if not is_trigger(text, adapter, raw_event):
+        print(f"[Bot] 跳过消息 — 未触发 (text={text[:50]}, user_id={user_id})")
         return
 
     # 提取干净的用户输入
@@ -78,6 +80,19 @@ def handle_group_message(
     if user_input == "/reset":
         sessions.reset(session_key)
         adapter.send_group_msg(group_id, f"[CQ:at,qq={user_id}] 你的对话已重置喵~")
+        return
+
+    if user_input == "/clearall":
+        is_creator = str(user_id) == str(QQ_BOT_CREATOR_ID)
+        if not is_creator:
+            adapter.send_group_msg(
+                group_id,
+                f"[CQ:at,qq={user_id}] 只有主人可以执行此命令喵~\n(你的ID: {user_id}, 主人ID: {QQ_BOT_CREATOR_ID})",
+            )
+            return
+        count = sessions.session_count
+        sessions.clear_all()
+        adapter.send_group_msg(group_id, f"[CQ:at,qq={user_id}] 已清空全部 {count} 个会话喵~")
         return
 
     if user_input == "/status":
@@ -109,7 +124,9 @@ def handle_group_message(
         agent_input = f"[用户: {nickname} (ID:{user_id})]\n{user_input}"
 
     try:
+        print(f"[Bot] 开始处理 — user={user_id}, input={user_input[:80]}")
         result = agent.run_cli(agent_input)
+        print(f"[Bot] 处理完成 — len={len(result)}")
         if result.strip():
             adapter.send_group_msg(group_id, f"[CQ:at,qq={user_id}] {result.strip()}")
         else:

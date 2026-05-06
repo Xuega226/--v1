@@ -53,20 +53,31 @@ def compress_messages(
     if total <= max_tokens:
         return messages
 
-    # 切分点：确保不会拆散 tool_calls / tool 配对
-    # 如果 recent 开头是 tool 消息，向前回溯把对应的 tool_calls 也纳入 recent
-    split_at = len(messages) - keep_recent
-    while split_at > 1:
+    # 切分点：保证 tool_calls 和对应的 tool 结果永远在一起
+    split_at = max(len(messages) - keep_recent, 1) if len(messages) > keep_recent else 1
+
+    # 从 split_at 向下扫描，跳过孤立的 tool 消息
+    while split_at < len(messages) - 1:
         if messages[split_at].get("role") == "tool":
+            split_at += 1
+        else:
+            break
+
+    # 从 split_at-1 向上扫描，找到最近的"安全"断点（非 tool_calls 发起者）
+    while split_at > 1:
+        role = messages[split_at].get("role", "")
+        if role == "tool":
             split_at -= 1
-        elif messages[split_at].get("role") == "assistant" and messages[split_at].get("tool_calls"):
-            # 这个 assistant 的 tool_calls 对应的 tool 结果可能在 recent 中
+        elif role == "assistant" and messages[split_at].get("tool_calls"):
             split_at -= 1
         else:
             break
 
     old = messages[:split_at]
     recent = messages[split_at:]
+
+    # 最后一道防线：清理 recent 中可能的孤立消息
+    recent = _repair_messages(recent)
 
     if summarize_fn:
         try:
@@ -76,14 +87,65 @@ def compress_messages(
     else:
         summary = _simple_truncate(old)
 
-    # 将系统消息（如果有）+ 摘要 + 最近消息合并
     result = [{"role": "system", "content": f"[历史上下文摘要]\n{summary}"}]
-    # 如果已有 system 消息，附加到摘要后面
     if messages and messages[0]["role"] == "system":
         result[0]["content"] = messages[0]["content"] + "\n\n---\n" + result[0]["content"]
 
     result.extend(recent)
     return result
+
+
+def _repair_messages(messages: list) -> list:
+    """修复消息列表，确保 tool_calls 和 tool 消息配对完整。
+
+    移除：
+    - 没有后续 tool 响应的 tool_calls
+    - 没有前置 tool_calls 的孤立 tool 消息
+    """
+    n = len(messages)
+
+    # Pass 1: 标记哪些消息需要移除
+    remove = [False] * n
+
+    # 收集所有 assistant+tool_calls 的 tool_call_id 和位置
+    for i, msg in enumerate(messages):
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            tc_ids = [tc.get("id", "") for tc in msg["tool_calls"]]
+            # 检查后续消息中是否都有对应的 tool 响应
+            matched = set()
+            for j in range(i + 1, n):
+                later = messages[j]
+                if later.get("role") == "tool":
+                    matched.add(later.get("tool_call_id", ""))
+                elif later.get("role") == "assistant":
+                    break  # 下一个 assistant 消息了，停止查找
+
+            missing = [tid for tid in tc_ids if tid not in matched]
+            if missing:
+                # 移除没有响应的 tool_calls
+                valid_tcs = [tc for tc in msg["tool_calls"] if tc.get("id", "") in matched]
+                if valid_tcs:
+                    # 保留消息但只保留有效的 tool_calls
+                    messages[i] = {**msg, "tool_calls": valid_tcs}
+                else:
+                    # 全部无效，移除 tool_calls
+                    new_msg = dict(msg)
+                    new_msg.pop("tool_calls", None)
+                    messages[i] = new_msg
+
+    # Pass 2: 移除孤立的 tool 消息
+    # 收集所有有效的 tool_call_id（来自 assistant+tool_calls）
+    valid_tc_ids = set()
+    for msg in messages:
+        for tc in msg.get("tool_calls") or []:
+            valid_tc_ids.add(tc.get("id", ""))
+
+    for i, msg in enumerate(messages):
+        if msg.get("role") == "tool":
+            if msg.get("tool_call_id", "") not in valid_tc_ids:
+                remove[i] = True
+
+    return [msg for i, msg in enumerate(messages) if not remove[i]]
 
 
 def _simple_truncate(messages: list, max_chars: int = 300) -> str:

@@ -4,10 +4,13 @@
 - HTTP API 发送消息/执行操作
 """
 
+import concurrent.futures
 import json
 import re
 import threading
 import time
+import urllib.request
+import urllib.error
 from websocket import WebSocketApp, WebSocketConnectionClosedException
 from config import (
     QQ_BOT_WS_URL,
@@ -99,6 +102,9 @@ class QQAdapter:
         self._group_message_handlers = []
         self._private_message_handlers = []
 
+        # 线程池：消息处理异步化，避免阻塞 WS reader 线程
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+
     # ── 回调注册 ──────────────────────────────────────────
 
     def on_group_message(self, handler):
@@ -134,6 +140,7 @@ class QQAdapter:
                 self._ws.close()
             except Exception:
                 pass
+        self._executor.shutdown(wait=False)
 
     # ── 消息发送 ──────────────────────────────────────────
 
@@ -150,29 +157,51 @@ class QQAdapter:
         except Exception as e:
             print(f"[QQAdapter] WS 发送失败: {e}")
 
+    def _http_post(self, action: str, params: dict) -> dict:
+        """通过 HTTP API 调用 OneBot action。"""
+        url = f"{self.http_url}/{action}"
+        body = json.dumps(params, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(url, data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        if self.access_token:
+            req.add_header("Authorization", f"Bearer {self.access_token}")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.URLError as e:
+            print(f"[QQAdapter] HTTP {action} 失败: {e}")
+            return {"status": "failed", "retcode": -1, "msg": str(e)}
+        except Exception as e:
+            print(f"[QQAdapter] HTTP {action} 异常: {e}")
+            return {"status": "failed", "retcode": -1, "msg": str(e)}
+
     def send_group_msg(self, group_id: int, text: str):
         """向群发送消息，超长自动分段。"""
         for chunk in split_long_text(text):
-            self._ws_send({
+            payload = {
                 "action": "send_group_msg",
                 "params": {
                     "group_id": group_id,
                     "message": [{"type": "text", "data": {"text": chunk}}],
                 },
-            })
+            }
+            print(f"[QQAdapter] WS发送: action=send_group_msg group={group_id} len={len(chunk)}")
+            self._ws_send(payload)
             if len(chunk) > QQ_MSG_MAX_LEN // 2:
                 time.sleep(0.3)
 
     def send_private_msg(self, user_id: int, text: str):
         """向用户发送私聊消息。"""
         for chunk in split_long_text(text):
-            self._ws_send({
+            payload = {
                 "action": "send_private_msg",
                 "params": {
                     "user_id": user_id,
                     "message": [{"type": "text", "data": {"text": chunk}}],
                 },
-            })
+            }
+            print(f"[QQAdapter] WS发送: action=send_private_msg user={user_id} len={len(chunk)}")
+            self._ws_send(payload)
             if len(chunk) > QQ_MSG_MAX_LEN // 2:
                 time.sleep(0.3)
 
@@ -182,6 +211,13 @@ class QQAdapter:
         return resp.get("data", {})
 
     # ── WebSocket ──────────────────────────────────────────
+
+    def _safe_call(self, handler, *args):
+        """在线程池中安全执行回调，捕获所有异常。"""
+        try:
+            handler(*args)
+        except Exception as e:
+            print(f"[QQAdapter] 消息回调异常: {type(e).__name__}: {e}")
 
     def _ws_loop(self):
         """WebSocket 主循环，断线自动重连。"""
@@ -246,18 +282,12 @@ class QQAdapter:
             group_id = event.get("group_id", 0)
             user_id = event.get("user_id", 0)
             for handler in self._group_message_handlers:
-                try:
-                    handler(group_id, user_id, text, event)
-                except Exception as e:
-                    print(f"[QQAdapter] 群消息回调异常: {type(e).__name__}: {e}")
+                self._executor.submit(self._safe_call, handler, group_id, user_id, text, event)
 
         elif message_type == "private":
             user_id = event.get("user_id", 0)
             for handler in self._private_message_handlers:
-                try:
-                    handler(user_id, text, event)
-                except Exception as e:
-                    print(f"[QQAdapter] 私聊消息回调异常: {type(e).__name__}: {e}")
+                self._executor.submit(self._safe_call, handler, user_id, text, event)
 
     def _on_error(self, ws, error):
         print(f"[QQAdapter] WebSocket 错误: {error}")

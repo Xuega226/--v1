@@ -93,6 +93,13 @@ class SessionManager:
         with self._lock:
             self._sessions.pop(session_key, None)
 
+    def clear_all(self):
+        """清空所有会话。"""
+        with self._lock:
+            count = len(self._sessions)
+            self._sessions.clear()
+            print(f"[SessionManager] 已清空全部 {count} 个会话")
+
     @property
     def session_count(self) -> int:
         with self._lock:
