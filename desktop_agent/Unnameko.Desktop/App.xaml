@@ -1,0 +1,12 @@
+<Application x:Class="Unnameko.Desktop.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             ShutdownMode="OnExplicitShutdown">
+    <Application.Resources>
+        <Color x:Key="LeafGreen">#78A98C</Color>
+        <SolidColorBrush x:Key="LeafBrush" Color="{StaticResource LeafGreen}" />
+        <SolidColorBrush x:Key="InkBrush" Color="#303932" />
+        <SolidColorBrush x:Key="SubtleBrush" Color="#718078" />
+        <SolidColorBrush x:Key="PanelBrush" Color="#F7FBF8" />
+    </Application.Resources>
+</Application>
