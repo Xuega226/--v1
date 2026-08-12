@@ -12,5 +12,6 @@
   </PropertyGroup>
   <ItemGroup>
     <Resource Include="Assets\unnameko.png" />
+    <Resource Include="Assets\Expressions\*.png" />
   </ItemGroup>
 </Project>

@@ -19,6 +19,8 @@ from config import (
     QQ_BOT_WS_URL,
     QQ_BOT_HTTP_URL,
     QQ_BOT_ACCESS_TOKEN,
+    QQ_BOT_NAME,
+    QQ_MESSAGE_MERGE_WINDOW,
     QQ_MSG_MAX_LEN,
 )
 
@@ -122,6 +124,31 @@ def extract_text(message) -> str:
     return str(message)
 
 
+def extract_image_segments(message) -> list[dict]:
+    """Extract normalized OneBot image data dictionaries without downloading them."""
+    if not isinstance(message, list):
+        return []
+    images = []
+    for segment in message:
+        if segment.get("type") != "image":
+            continue
+        data = segment.get("data") or {}
+        if isinstance(data, dict):
+            images.append(dict(data))
+    return images
+
+
+def extract_reply_id(message) -> str:
+    if not isinstance(message, list):
+        return ""
+    for segment in message:
+        if segment.get("type") == "reply":
+            reply_id = (segment.get("data") or {}).get("id", "")
+            if reply_id != "":
+                return str(reply_id)
+    return ""
+
+
 def _has_at(message, self_id: str) -> bool:
     """检查消息是否 @了机器人。"""
     if isinstance(message, list):
@@ -171,6 +198,77 @@ def _split_cq_safe(text: str, max_len: int) -> list:
     return chunks
 
 
+_WAKEUP_PUNCTUATION_RE = re.compile(r"[\s,，。.!！?？~～、:：;；…·]+")
+
+
+def _is_pure_wakeup(text: str, event: dict, bot_name: str, self_id: str) -> bool:
+    """Whether a fragment only wakes the bot instead of adding message content."""
+    normalized = _WAKEUP_PUNCTUATION_RE.sub("", text or "")
+    named = bool(bot_name and normalized == _WAKEUP_PUNCTUATION_RE.sub("", bot_name))
+    at_only = not normalized and bool(self_id) and _has_at(event.get("message", []), self_id)
+    return named or at_only
+
+
+def merge_group_message_batch(
+    batch: list[tuple[str, dict]],
+    bot_name: str = "",
+    self_id: str = "",
+) -> tuple[str, dict]:
+    """Merge adjacent fragments while preserving their original risk-counting units.
+
+    The final event uses the latest message id so replies point at the wake-up fragment.
+    All original message segments remain available for image/@/reply detection.
+    """
+    if not batch:
+        return "", {}
+
+    originals = []
+    wakeup_flags = []
+    for text, event in batch:
+        wakeup_flags.append(_is_pure_wakeup(text, event, bot_name, self_id))
+        originals.append(
+            {
+                "text": text,
+                "message_id": event.get("message_id", ""),
+            }
+        )
+
+    has_substantive_text = any(
+        bool((text or "").strip()) and not wakeup
+        for (text, _event), wakeup in zip(batch, wakeup_flags)
+    )
+    text_parts = []
+    for (text, _event), wakeup in zip(batch, wakeup_flags):
+        cleaned = (text or "").strip()
+        if not cleaned or (wakeup and has_substantive_text):
+            continue
+        text_parts.append(cleaned)
+
+    merged_event = dict(batch[-1][1])
+    merged_segments = []
+    raw_parts = []
+    for index, (_text, event) in enumerate(batch):
+        message = event.get("message", [])
+        if isinstance(message, list):
+            if index and merged_segments:
+                merged_segments.append({"type": "text", "data": {"text": "\n"}})
+            merged_segments.extend(message)
+        raw = str(event.get("raw_message", "") or "")
+        if raw:
+            raw_parts.append(raw)
+
+    if merged_segments:
+        merged_event["message"] = merged_segments
+    if raw_parts:
+        merged_event["raw_message"] = "\n".join(raw_parts)
+    merged_event["_merged_messages"] = originals
+    merged_event["_batch_direct_trigger"] = any(wakeup_flags) or any(
+        bool(self_id) and _has_at(event.get("message", []), self_id)
+        for _text, event in batch
+    )
+    return "\n".join(text_parts), merged_event
+
+
 class QQAdapter:
     """OneBot v11 适配器。
 
@@ -209,6 +307,11 @@ class QQAdapter:
 
         # 线程池：消息处理异步化，避免阻塞 WS reader 线程
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+        # 同一群严格 FIFO；不同群仍可在线程池中并行处理。
+        self._group_queues: dict[object, deque] = {}
+        self._active_group_queues: set[object] = set()
+        self._group_queue_condition = threading.Condition()
+        self._message_merge_window = max(0.0, QQ_MESSAGE_MERGE_WINDOW)
 
     # ── 回调注册 ──────────────────────────────────────────
 
@@ -358,10 +461,111 @@ class QQAdapter:
             if len(chunk) > QQ_MSG_MAX_LEN // 2:
                 time.sleep(0.3)
 
+    def send_qzone_msg(
+        self,
+        content: str,
+        images: list[str] | None = None,
+        ugc_right: int = 4,
+        target_uins: list[str | int] | None = None,
+    ) -> dict:
+        """发表 QQ 空间说说并返回规范化结果。
+
+        NapCat 4.18.18 的 ``send_qzone_msg`` 支持纯文字、多图和可见范围。
+        这个封装始终等待真实回执，因为调用方必须持久化 tid 来防止重复发布。
+        """
+        content = str(content or "").strip()
+        if not content:
+            return {"ok": False, "tid": "", "message": "空间动态正文不能为空"}
+        try:
+            visibility = int(ugc_right)
+        except (TypeError, ValueError):
+            visibility = -1
+        if visibility not in (1, 4, 16, 64, 128):
+            return {"ok": False, "tid": "", "message": "不支持的空间可见范围"}
+        targets = [str(item) for item in (target_uins or []) if str(item).isdigit()]
+        if visibility in (16, 128) and not targets:
+            return {"ok": False, "tid": "", "message": "部分好友权限必须提供 QQ 号列表"}
+
+        params = {
+            "content": content,
+            "images": [str(item) for item in (images or [])],
+            "ugc_right": visibility,
+        }
+        if targets:
+            params["target_uins"] = targets
+        result = self._ws_send_wait(
+            {"action": "send_qzone_msg", "params": params},
+            timeout=60 if images else 25,
+        )
+        if result.get("status") == "ok" and result.get("retcode", 0) == 0:
+            tid = str((result.get("data") or {}).get("tid") or "")
+            if tid:
+                print(f"[QQAdapter] QQ 空间动态发布成功: tid={tid}")
+                return {"ok": True, "tid": tid, "message": ""}
+            return {"ok": False, "tid": "", "message": "NapCat 未返回说说 tid", "raw": result}
+        message = str(result.get("message") or result.get("msg") or "NapCat 发布失败")
+        print(f"[QQAdapter] QQ 空间动态发布失败: response={result}")
+        return {"ok": False, "tid": "", "message": message, "raw": result}
+
+    def delete_qzone_msg(self, tid: str) -> dict:
+        """按 send_qzone_msg 返回的 tid 删除一条 QQ 空间说说。"""
+        tid = str(tid or "").strip()
+        if not tid:
+            return {"ok": False, "message": "说说 tid 不能为空"}
+        result = self._ws_send_wait(
+            {"action": "delete_qzone_msg", "params": {"tid": tid}},
+            timeout=25,
+        )
+        if result.get("status") == "ok" and result.get("retcode", 0) == 0:
+            print(f"[QQAdapter] QQ 空间动态删除成功: tid={tid}")
+            return {"ok": True, "message": ""}
+        message = str(result.get("message") or result.get("msg") or "NapCat 删除失败")
+        print(f"[QQAdapter] QQ 空间动态删除失败: tid={tid} response={result}")
+        return {"ok": False, "message": message, "raw": result}
+
     def get_group_info(self, group_id: int) -> dict:
         """获取群信息。"""
         resp = self._http_post("get_group_info", {"group_id": group_id})
         return resp.get("data", {})
+
+    def get_image(self, file_id: str) -> dict:
+        """Ask NapCat to resolve an incoming image file id to a local path or URL."""
+        if not file_id:
+            return {}
+        resp = self._http_post("get_image", {"file": file_id})
+        if resp.get("status") == "ok" and resp.get("retcode", 0) == 0:
+            return resp.get("data") or {}
+        print(f"[QQAdapter] get_image 失败: file={file_id} response={resp}")
+        return {}
+
+    def get_message(self, message_id: str | int) -> dict:
+        """Fetch a referenced message so images in reply messages can be analyzed."""
+        if str(message_id) == "":
+            return {}
+        resp = self._http_post("get_msg", {"message_id": message_id})
+        if resp.get("status") == "ok" and resp.get("retcode", 0) == 0:
+            return resp.get("data") or {}
+        print(f"[QQAdapter] get_msg 失败: message_id={message_id} response={resp}")
+        return {}
+
+    def collect_event_images(self, event: dict, include_reply: bool = True) -> list[dict]:
+        """Collect current images and, when requested, images from the replied message."""
+        images = extract_image_segments(event.get("message", []))
+        if include_reply:
+            reply_id = extract_reply_id(event.get("message", []))
+            if reply_id:
+                replied = self.get_message(reply_id)
+                images.extend(extract_image_segments(replied.get("message", [])))
+        # OneBot can repeat the same image in merged segments; deduplicate by stable fields.
+        unique = []
+        seen = set()
+        for item in images:
+            key = str(item.get("file") or item.get("file_id") or item.get("url") or item)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(item)
+        return unique
 
     # ── WebSocket ──────────────────────────────────────────
 
@@ -371,6 +575,81 @@ class QQAdapter:
             handler(*args)
         except Exception as e:
             print(f"[QQAdapter] 消息回调异常: {type(e).__name__}: {e}")
+
+    def _submit_group_message(self, group_id, user_id, text, event):
+        """Queue one event without ever running two callbacks for a group concurrently."""
+        key = str(group_id)
+        item = {
+            "group_id": group_id,
+            "user_id": user_id,
+            "text": text,
+            "event": event,
+            "received_at": time.monotonic(),
+            "handlers": tuple(self._group_message_handlers),
+        }
+        with self._group_queue_condition:
+            queue = self._group_queues.setdefault(key, deque())
+            queue.append(item)
+            self._group_queue_condition.notify_all()
+            if key in self._active_group_queues:
+                return
+            self._active_group_queues.add(key)
+        try:
+            self._executor.submit(self._drain_group_queue, key)
+        except RuntimeError:
+            with self._group_queue_condition:
+                self._active_group_queues.discard(key)
+
+    def _drain_group_queue(self, key):
+        """Drain one group's FIFO, debouncing adjacent fragments from the same user."""
+        while True:
+            with self._group_queue_condition:
+                queue = self._group_queues.get(key)
+                if not queue:
+                    self._group_queues.pop(key, None)
+                    self._active_group_queues.discard(key)
+                    return
+
+                first = queue.popleft()
+                items = [first]
+                deadline = first["received_at"] + self._message_merge_window
+                while self._message_merge_window > 0:
+                    if queue:
+                        next_item = queue[0]
+                        # Another speaker closes the current fragment batch immediately.
+                        if str(next_item["user_id"]) != str(first["user_id"]):
+                            break
+                        items.append(queue.popleft())
+                        # A name-only/@-only fragment completes the thought: it wakes
+                        # the buffered content and should not add another debounce delay.
+                        if _is_pure_wakeup(
+                            next_item["text"],
+                            next_item["event"],
+                            QQ_BOT_NAME,
+                            self._self_id,
+                        ):
+                            break
+                        deadline = next_item["received_at"] + self._message_merge_window
+                        continue
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self._group_queue_condition.wait(remaining)
+
+            merged_text, merged_event = merge_group_message_batch(
+                [(item["text"], item["event"]) for item in items],
+                bot_name=QQ_BOT_NAME,
+                self_id=self._self_id,
+            )
+            handlers = items[0]["handlers"]
+            for handler in handlers:
+                self._safe_call(
+                    handler,
+                    first["group_id"],
+                    first["user_id"],
+                    merged_text,
+                    merged_event,
+                )
 
     def _ws_loop(self):
         """WebSocket 主循环，断线自动重连。"""
@@ -449,8 +728,7 @@ class QQAdapter:
         if message_type == "group":
             group_id = event.get("group_id", 0)
             user_id = event.get("user_id", 0)
-            for handler in self._group_message_handlers:
-                self._executor.submit(self._safe_call, handler, group_id, user_id, text, event)
+            self._submit_group_message(group_id, user_id, text, event)
 
         elif message_type == "private":
             user_id = event.get("user_id", 0)
