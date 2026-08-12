@@ -629,6 +629,29 @@
                                     <Button Content="立即检查" Width="68" Height="27" Margin="0,0,0,6"
                                             Click="RunAutonomyButton_Click" />
                                 </WrapPanel>
+                                <TextBlock Text="她现在想做什么" Margin="0,7,0,4" FontWeight="SemiBold"
+                                           Foreground="{StaticResource InkBrush}" />
+                                <Border Padding="9" CornerRadius="10" Background="#F8FBF8"
+                                        BorderBrush="#3578A98C" BorderThickness="1">
+                                    <TextBlock x:Name="AutonomyIntentText" Text="当前没有形成新的自主意图。"
+                                               FontSize="10" TextWrapping="Wrap" Foreground="#52685A" />
+                                </Border>
+                                <TextBlock Text="委托权限包" Margin="0,10,0,4" FontWeight="SemiBold"
+                                           Foreground="{StaticResource InkBrush}" />
+                                <TextBlock Text="权限包只组合既有低风险能力，不允许修改正式文件、执行程序或对外发送。"
+                                           FontSize="10" TextWrapping="Wrap" Foreground="{StaticResource SubtleBrush}" />
+                                <WrapPanel Margin="0,6,0,0">
+                                    <Button Content="项目陪跑 7 天" Width="100" Height="26" Margin="0,0,6,5"
+                                            Click="GrantProjectPackageButton_Click" />
+                                    <Button Content="研究助手 7 天" Width="100" Height="26" Margin="0,0,6,5"
+                                            Click="GrantResearchPackageButton_Click" />
+                                    <Button x:Name="RevokePackageButton" Content="撤销选中权限包" Width="110" Height="26"
+                                            Margin="0,0,0,5" IsEnabled="False" Click="RevokePackageButton_Click" />
+                                </WrapPanel>
+                                <ListBox x:Name="AutonomyPackageListBox" Height="78" DisplayMemberPath="Display"
+                                         SelectionChanged="AutonomyPackageListBox_SelectionChanged"
+                                         ScrollViewer.VerticalScrollBarVisibility="Auto"
+                                         ScrollViewer.HorizontalScrollBarVisibility="Disabled" />
                                 <TextBlock Text="当前有效能力卡" Margin="0,7,0,4" FontWeight="SemiBold"
                                            Foreground="{StaticResource InkBrush}" />
                                 <ListBox x:Name="AutonomyGrantListBox" Height="86" DisplayMemberPath="Display"
@@ -690,6 +713,15 @@
                                          ScrollViewer.HorizontalScrollBarVisibility="Disabled" />
                                 <Button Content="清除反馈学习" Height="25" Margin="0,5,0,0"
                                         Click="ResetAutonomyPreferencesButton_Click" />
+                                <TextBlock Text="生活连续性、信任与熔断" Margin="0,12,0,4" FontWeight="SemiBold"
+                                           Foreground="{StaticResource InkBrush}" />
+                                <TextBlock x:Name="AutonomyTrustText" FontSize="10" TextWrapping="Wrap"
+                                           Foreground="#66806E" />
+                                <Button x:Name="ResetCircuitButton" Content="解除自主行动熔断" Height="25"
+                                        Margin="0,5,0,0" Visibility="Collapsed" Click="ResetCircuitButton_Click" />
+                                <ListBox x:Name="AutonomyLifeJournalListBox" Height="100" DisplayMemberPath="Display"
+                                         Margin="0,5,0,0" ScrollViewer.VerticalScrollBarVisibility="Auto"
+                                         ScrollViewer.HorizontalScrollBarVisibility="Disabled" />
                                 <TextBlock Text="最近审计" Margin="0,12,0,4" FontWeight="SemiBold"
                                            Foreground="{StaticResource InkBrush}" />
                                 <ListBox x:Name="AutonomyAuditListBox" Height="100" DisplayMemberPath="Display"

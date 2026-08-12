@@ -1589,6 +1589,26 @@ class DesktopCore:
                 client.send({"type": "autonomy.snapshot", "request_id": request_id, "snapshot": snapshot})
             except (AutonomyError, TypeError, ValueError) as exc:
                 client.send({"type": "autonomy.error", "request_id": request_id, "message": str(exc)})
+        elif kind == "autonomy.package_grant":
+            try:
+                snapshot = self.autonomy.enable_delegation_package(
+                    project_id=str(message.get("project_id", "")),
+                    mode=str(message.get("mode", "project_helper")),
+                    valid_days=int(message.get("valid_days", 7)),
+                )
+                client.send({"type": "autonomy.snapshot", "request_id": request_id, "snapshot": snapshot})
+                self._advance_autonomy()
+            except (AutonomyError, TypeError, ValueError) as exc:
+                client.send({"type": "autonomy.error", "request_id": request_id, "message": str(exc)})
+        elif kind == "autonomy.package_revoke":
+            try:
+                snapshot = self.autonomy.revoke_package(str(message.get("package_id", "")))
+                client.send({"type": "autonomy.snapshot", "request_id": request_id, "snapshot": snapshot})
+            except AutonomyError as exc:
+                client.send({"type": "autonomy.error", "request_id": request_id, "message": str(exc)})
+        elif kind == "autonomy.circuit_reset":
+            client.send({"type": "autonomy.snapshot", "request_id": request_id,
+                         "snapshot": self.autonomy.reset_circuit()})
         elif kind == "autonomy.pause":
             snapshot = self.autonomy.set_paused(bool(message.get("paused", True)))
             client.send({"type": "autonomy.snapshot", "request_id": request_id, "snapshot": snapshot})
@@ -1870,6 +1890,9 @@ class DesktopCore:
                 "enabled": autonomy["enabled"],
                 "paused": autonomy["paused"],
                 "active_grants": autonomy["active_grant_count"],
+                "active_packages": autonomy.get("active_package_count", 0),
+                "active_intents": autonomy.get("active_intent_count", 0),
+                "circuit": autonomy.get("circuit", {}).get("status", "closed"),
                 "queued": autonomy["queued_count"],
                 "drafts": autonomy["draft_count"],
             },

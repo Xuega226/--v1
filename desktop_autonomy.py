@@ -59,9 +59,14 @@ class DesktopAutonomyManager:
     @staticmethod
     def _default_state() -> dict[str, Any]:
         return {
-            "version": 2, "enabled": False, "paused": False,
+            "version": 3, "enabled": False, "paused": False,
             "grants": [], "jobs": [], "audit": [], "adoption_tasks": {},
             "goals": [], "decisions": [], "feedback": [], "preferences": {}, "inbox": [], "costs": [],
+            "context_snapshots": [], "intents": [], "packages": [], "life_journal": [], "trust": {},
+            "circuit": {
+                "status": "closed", "opened_at": 0.0, "open_until": 0.0, "reason": "",
+                "consecutive_failures": 0, "last_failure_at": 0.0, "last_success_at": 0.0,
+            },
             "limits": {
                 "max_files_per_day": 3, "max_bytes_per_file": 100_000, "max_failures_per_day": 2,
                 "max_network_requests_per_day": 2, "max_network_bytes_per_day": 500_000,
@@ -77,7 +82,7 @@ class DesktopAutonomyManager:
             if not isinstance(value, dict):
                 return
             self._state = {
-                **self._state, **value, "version": 2,
+                **self._state, **value, "version": 3,
                 "grants": value.get("grants", []) if isinstance(value.get("grants"), list) else [],
                 "jobs": value.get("jobs", []) if isinstance(value.get("jobs"), list) else [],
                 "audit": value.get("audit", []) if isinstance(value.get("audit"), list) else [],
@@ -88,6 +93,12 @@ class DesktopAutonomyManager:
                 "preferences": value.get("preferences", {}) if isinstance(value.get("preferences"), dict) else {},
                 "inbox": value.get("inbox", []) if isinstance(value.get("inbox"), list) else [],
                 "costs": value.get("costs", []) if isinstance(value.get("costs"), list) else [],
+                "context_snapshots": value.get("context_snapshots", []) if isinstance(value.get("context_snapshots"), list) else [],
+                "intents": value.get("intents", []) if isinstance(value.get("intents"), list) else [],
+                "packages": value.get("packages", []) if isinstance(value.get("packages"), list) else [],
+                "life_journal": value.get("life_journal", []) if isinstance(value.get("life_journal"), list) else [],
+                "trust": value.get("trust", {}) if isinstance(value.get("trust"), dict) else {},
+                "circuit": {**self._state["circuit"], **(value.get("circuit", {}) if isinstance(value.get("circuit"), dict) else {})},
                 "limits": {**self._state["limits"], **(value.get("limits", {}) if isinstance(value.get("limits"), dict) else {})},
             }
             for grant in self._state["grants"]:
@@ -98,6 +109,16 @@ class DesktopAutonomyManager:
                             operations.append(operation)
             for job in self._state["jobs"]:
                 self._migrate_job(job)
+            for intent in self._state["intents"]:
+                self._migrate_intent(intent)
+            migrated = self._migrate_legacy_queued_intents()
+            if migrated:
+                self._record(
+                    "migration.v6_intents",
+                    f"为 {migrated} 个升级前待处理工作补建了可追溯意图",
+                    time.time(),
+                )
+                self._save()
         except (OSError, TypeError, ValueError):
             pass
 
@@ -114,6 +135,12 @@ class DesktopAutonomyManager:
                     job["status"] = "queued"
                     job["error"] = "核心重启后已安全恢复到待处理队列"
                     job["updated_at"] = time.time()
+                    intent = self._intent(str(job.get("intent_id", "")))
+                    if intent:
+                        self._transition_intent(
+                            intent, "authorized", job["updated_at"],
+                            "核心重启后已恢复为待执行；尚未声称行动完成",
+                        )
                     changed = True
             for temporary in self.drafts_dir.glob("*.tmp"):
                 try:
@@ -178,6 +205,97 @@ class DesktopAutonomyManager:
             self._save()
             return self.snapshot(now)
 
+    def enable_delegation_package(self, *, project_id: str = "", mode: str = "project_helper",
+                                  valid_days: int = 7, now: float | None = None) -> dict[str, Any]:
+        """Create a revocable bundle of existing low-risk grants.
+
+        A package improves usability, not authority: it can only compose the
+        existing draft/read/diff and public-web grants and never permits edits,
+        deletion, execution, publication, login, upload, or external messaging.
+        """
+        now = time.time() if now is None else float(now)
+        mode = str(mode or "project_helper").strip().lower()
+        if mode not in ("project_helper", "research_helper", "light_maintenance"):
+            raise AutonomyError("不支持的委托权限包")
+        project_id = str(project_id or "")[:80]
+        if mode in ("project_helper", "research_helper") and not project_id:
+            raise AutonomyError("项目助手权限包必须绑定一个具体项目")
+        valid_days = max(1, min(30, int(valid_days)))
+        with self._lock:
+            existing = next((item for item in self._state["packages"]
+                             if item.get("status") == "active" and item.get("mode") == mode
+                             and item.get("project_id") == project_id
+                             and float(item.get("expires_at", 0.0)) > now), None)
+            if existing:
+                return self.snapshot(now)
+            before = {grant["grant_id"] for grant in self._state["grants"]}
+            self.enable_default_grant(
+                project_id=project_id, valid_days=valid_days,
+                max_files_per_day=2 if mode != "light_maintenance" else 1, now=now,
+            )
+            if mode == "research_helper":
+                self.enable_network_grant(
+                    project_id=project_id, valid_days=min(valid_days, 7), max_requests_per_day=1, now=now,
+                )
+            owned = [grant["grant_id"] for grant in self._state["grants"] if grant["grant_id"] not in before]
+            linked = [grant["grant_id"] for grant in self._active_grants(now)
+                      if str(grant.get("project_id", "")) == project_id
+                      and ("create_draft" in grant.get("operations", [])
+                           or (mode == "research_helper" and "network_research" in grant.get("operations", [])))]
+            package = {
+                "package_id": uuid.uuid4().hex,
+                "name": {"project_helper": "项目陪跑助手包", "research_helper": "项目研究助手包",
+                         "light_maintenance": "轻量整理助手包"}[mode],
+                "mode": mode, "status": "active", "project_id": project_id,
+                "grant_ids": linked, "owned_grant_ids": owned,
+                "created_at": now, "expires_at": now + valid_days * 86400,
+                "revoked_at": 0.0, "max_actions_per_day": 2 if mode != "light_maintenance" else 1,
+                "post_action_review": True,
+                "boundaries": ["仅使用既有低风险能力", "每次行动后进入自主收件箱", "主人可随时撤销",
+                               "不修改正式文件", "不执行程序", "不向外发送"],
+            }
+            self._state["packages"].append(package)
+            self._record("package.created", f"主人启用了{package['name']}", now,
+                         package_id=package["package_id"], project_id=project_id)
+            self._save()
+            return self.snapshot(now)
+
+    def revoke_package(self, package_id: str, now: float | None = None) -> dict[str, Any]:
+        now = time.time() if now is None else float(now)
+        with self._lock:
+            package = next((item for item in self._state["packages"]
+                            if item.get("package_id") == str(package_id)), None)
+            if not package:
+                raise AutonomyError("没有找到这个委托权限包")
+            package.update(status="revoked", revoked_at=now)
+            owned = set(str(item) for item in package.get("owned_grant_ids", package.get("grant_ids", [])))
+            for grant in self._state["grants"]:
+                if grant.get("grant_id") in owned and grant.get("status") == "active":
+                    grant.update(status="revoked", revoked_at=now)
+            for job in self._state["jobs"]:
+                if job.get("package_id") == package_id and job.get("status") == "queued":
+                    job.update(status="cancelled", error="委托权限包已撤销", updated_at=now)
+                    intent = self._intent(str(job.get("intent_id", "")))
+                    if intent:
+                        self._transition_intent(intent, "cancelled", now, "主人撤销了对应委托权限包")
+            if not self._active_grants(now):
+                self._state["enabled"] = False
+            self._record("package.revoked", f"主人撤销了{package.get('name', '委托权限包')}", now,
+                         package_id=package_id)
+            self._save()
+            return self.snapshot(now)
+
+    def reset_circuit(self, now: float | None = None) -> dict[str, Any]:
+        now = time.time() if now is None else float(now)
+        with self._lock:
+            self._state["circuit"] = {
+                **self._state["circuit"], "status": "half_open", "opened_at": 0.0,
+                "open_until": 0.0, "reason": "", "consecutive_failures": 0,
+            }
+            self._record("circuit.reset", "主人允许熔断后进行一次低风险安全试探", now)
+            self._save()
+            return self.snapshot(now)
+
     def set_paused(self, paused: bool, now: float | None = None) -> dict[str, Any]:
         now = time.time() if now is None else float(now)
         with self._lock:
@@ -198,6 +316,9 @@ class DesktopAutonomyManager:
             for job in self._state["jobs"]:
                 if job.get("grant_id") == grant_id and job.get("status") == "queued":
                     job.update(status="cancelled", error="能力卡已撤销", updated_at=now)
+                    intent = self._intent(str(job.get("intent_id", "")))
+                    if intent:
+                        self._transition_intent(intent, "cancelled", now, "主人撤销了对应能力卡")
             if not self._active_grants(now):
                 self._state["enabled"] = False
             self._record("grant.revoked", "主人撤销了自主草稿能力", now, grant_id=grant_id)
@@ -212,6 +333,8 @@ class DesktopAutonomyManager:
         projects = snapshot.get("projects", []) if isinstance(snapshot, dict) else []
         candidates: list[tuple[float, dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]] = []
         with self._lock:
+            if not self._circuit_allows(now):
+                return queued
             for project in projects:
                 if not isinstance(project, dict) or project.get("archived"):
                     continue
@@ -254,12 +377,30 @@ class DesktopAutonomyManager:
                     continue
                 project_id = str(project.get("project_id", ""))
                 kind = str(opportunity.get("kind", ""))
+                package = self._matching_package(str(grant.get("grant_id", "")), project_id, now)
+                if package:
+                    package_limit = self._package_daily_limit(package, project_id, kind)
+                    package_used = self._package_daily_count(str(package.get("package_id", "")), now)
+                    package_queued = sum(1 for item in self._state["jobs"]
+                                         if item.get("package_id") == package.get("package_id")
+                                         and item.get("status") == "queued")
+                    if package_used + package_queued >= package_limit:
+                        self._decision("package_budget_deferred", project, opportunity, now, score,
+                                       f"委托权限包今日额度 {package_used}/{package_limit}，等待下一额度周期",
+                                       meta["fingerprint"], breakdown=meta["breakdown"],
+                                       package_id=package.get("package_id", ""))
+                        continue
+                context_snapshot = self._capture_context(snapshot, now)
                 goal = self._create_goal(project, opportunity, score, now)
+                intent = self._create_intent(
+                    project, opportunity, grant, score, meta["breakdown"], context_snapshot, goal, now
+                )
                 read_context = self._read_project_context(project, grant)
                 network_request = self._network_request(opportunity)
                 job = {
                     "job_id": uuid.uuid4().hex, "idempotency_key": meta["key"], "fingerprint": meta["fingerprint"],
-                    "goal_id": goal["goal_id"], "grant_id": grant["grant_id"],
+                    "goal_id": goal["goal_id"], "intent_id": intent["intent_id"], "grant_id": grant["grant_id"],
+                    "package_id": str(package.get("package_id", "")) if package else "",
                     "project_id": project_id, "project_title": str(project.get("title", "未命名项目"))[:120],
                     "opportunity_id": str(opportunity.get("opportunity_id", ""))[:80],
                     "opportunity_kind": kind, "title": str(opportunity.get("title", "项目草稿"))[:160],
@@ -273,7 +414,11 @@ class DesktopAutonomyManager:
                     "error": "", "attempts": 0, "adoption_task_id": "", "feedback": "",
                     "created_at": now, "updated_at": now, "completed_at": 0.0,
                 }
+                intent["package_id"] = str(package.get("package_id", "")) if package else ""
+                intent["package_name"] = str(package.get("name", "")) if package else ""
                 self._state["jobs"].append(job)
+                intent["job_id"] = job["job_id"]
+                self._transition_intent(intent, "authorized", now, "价值仲裁通过，且匹配到有效能力卡")
                 queued.append(deepcopy(job))
                 self._decision("selected", project, opportunity, now, score,
                                "在今日候选中价值最高且能力卡允许", meta["fingerprint"],
@@ -295,18 +440,29 @@ class DesktopAutonomyManager:
             if not job:
                 return None
             grant = self._grant(str(job.get("grant_id", "")))
+            intent = self._intent(str(job.get("intent_id", "")))
             if not grant or not self._grant_active(grant, now):
                 job.update(status="cancelled", error="能力卡已失效或撤销", updated_at=now)
+                if intent:
+                    self._transition_intent(intent, "cancelled", now, job["error"])
                 self._record("job.cancelled", job["error"], now, job_id=job["job_id"])
                 self._save()
                 return deepcopy(job)
+            if not self._circuit_allows(now):
+                if intent:
+                    self._transition_intent(intent, "blocked", now, self._state["circuit"].get("reason", "异常熔断中"))
+                self._save()
+                return None
             if self._daily_created_count(now) >= int(self._state["limits"]["max_files_per_day"]):
                 return None
             if self._daily_created_count(now, grant_id=str(grant.get("grant_id", ""))) >= int(grant.get("max_files_per_day", 3)):
                 return None
-            if self._daily_count("failed", now) >= int(self._state["limits"]["max_failures_per_day"]):
+            if (self._daily_count("failed", now) >= int(self._state["limits"]["max_failures_per_day"])
+                    and self._state["circuit"].get("status") != "half_open"):
                 return None
             job.update(status="generating", attempts=int(job.get("attempts", 0)) + 1, updated_at=now)
+            if intent:
+                self._transition_intent(intent, "executing", now, "开始执行能力卡允许的低风险本地行动")
             self._save()
             temporary: Path | None = None
             try:
@@ -331,13 +487,17 @@ class DesktopAutonomyManager:
                 digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
                 job.update(status="completed", draft_path=str(target), content_sha256=digest,
                            bytes=len(content.encode("utf-8")), validation=checks, error="",
-                           updated_at=now, completed_at=now)
+                           post_action_review="pending", updated_at=now, completed_at=now)
                 self._complete_goal(str(job.get("goal_id", "")), review, now)
                 self._inbox("draft_ready", job, now,
                             f"未名子为“{job['project_title']}”整理好了“{job['title']}”，"
                             f"价值分 {job.get('value_score', 0):.2f}，复核 {review['score']:.0%}。")
                 self._record("job.completed", f"自主草稿已通过验证：{job['relative_path']}", now,
                              job_id=job["job_id"], sha256=digest)
+                if intent:
+                    self._transition_intent(intent, "completed", now, "草稿生成、安全验证和自我复核均通过",
+                                            outcome={"draft_path": str(target), "review_score": review["score"]})
+                self._note_action_outcome(job, True, now)
             except Exception as exc:
                 if temporary is not None:
                     try:
@@ -347,6 +507,9 @@ class DesktopAutonomyManager:
                 job.update(status="failed", error=f"{type(exc).__name__}: {str(exc)[:300]}", updated_at=now)
                 self._fail_goal(str(job.get("goal_id", "")), job["error"], now)
                 self._record("job.failed", job["error"], now, job_id=job["job_id"])
+                if intent:
+                    self._transition_intent(intent, "failed", now, job["error"])
+                self._note_action_outcome(job, False, now, job["error"])
             self._save()
             return deepcopy(job)
 
@@ -452,6 +615,12 @@ class DesktopAutonomyManager:
             self._state["feedback"].append(entry)
             self._state["feedback"] = self._state["feedback"][-200:]
             job["feedback"] = action
+            job["post_action_review"] = "confirmed" if action in ("adopt", "edited_adopt", "more") else "adjusted"
+            for item in self._state["inbox"]:
+                if item.get("job_id") == str(job_id):
+                    item["post_action_review"] = job["post_action_review"]
+                    item["reviewed_at"] = now
+            self._learn_trust(job, action, now)
             self._record("feedback.learned", f"主人反馈：{action}", now, job_id=job_id, preference_key=key)
             self._save()
             return self.snapshot(now)
@@ -460,7 +629,8 @@ class DesktopAutonomyManager:
         now = time.time() if now is None else float(now)
         with self._lock:
             self._state["preferences"] = {}
-            self._record("feedback.reset", "主人清除了自主偏好学习", now)
+            self._state["trust"] = {}
+            self._record("feedback.reset", "主人清除了自主偏好与信任学习", now)
             self._save()
             return self.snapshot(now)
 
@@ -472,6 +642,10 @@ class DesktopAutonomyManager:
                 raise AutonomyError("没有找到这条自主收件箱记录")
             item["status"] = "read"
             item["read_at"] = now
+            item["post_action_review"] = "viewed"
+            job = self._job(str(item.get("job_id", "")))
+            if job and job.get("post_action_review") == "pending":
+                job["post_action_review"] = "viewed"
             self._save()
             return self.snapshot(now)
 
@@ -486,8 +660,17 @@ class DesktopAutonomyManager:
             goals_by_id = {str(item.get("goal_id", "")): item for item in self._state["goals"]}
             for job in jobs:
                 job["goal"] = deepcopy(goals_by_id.get(str(job.get("goal_id", "")), {}))
+                job["intent"] = deepcopy(next((item for item in self._state["intents"]
+                                               if item.get("intent_id") == job.get("intent_id")), {}))
+            packages = deepcopy(self._state["packages"])
+            for package in packages:
+                if package.get("status") == "active" and float(package.get("expires_at", 0.0)) <= now:
+                    package["status"] = "expired"
+            circuit = deepcopy(self._state["circuit"])
+            if circuit.get("status") == "open" and float(circuit.get("open_until", 0.0)) <= now:
+                circuit["status"] = "half_open"
             return {
-                "version": 2, "enabled": bool(self._state.get("enabled")),
+                "version": 3, "enabled": bool(self._state.get("enabled")),
                 "paused": bool(self._state.get("paused")), "level": "L1/L2",
                 "drafts_dir": str(self.drafts_dir), "grants": grants,
                 "active_grant_count": sum(1 for grant in grants if grant.get("status") == "active"),
@@ -499,6 +682,14 @@ class DesktopAutonomyManager:
                 "decisions": list(reversed(deepcopy(self._state["decisions"][-100:]))),
                 "feedback": list(reversed(deepcopy(self._state["feedback"][-80:]))),
                 "preferences": deepcopy(self._state["preferences"]),
+                "context_snapshots": list(reversed(deepcopy(self._state["context_snapshots"][-30:]))),
+                "intents": list(reversed(deepcopy(self._state["intents"][-100:]))),
+                "active_intent_count": sum(1 for item in self._state["intents"]
+                                           if item.get("status") in ("proposed", "authorized", "executing")),
+                "packages": packages,
+                "active_package_count": sum(1 for item in packages if item.get("status") == "active"),
+                "life_journal": list(reversed(deepcopy(self._state["life_journal"][-80:]))),
+                "trust": deepcopy(self._state["trust"]), "circuit": circuit,
                 "inbox": list(reversed(deepcopy(self._state["inbox"][-80:]))),
                 "unread_inbox_count": sum(1 for item in self._state["inbox"] if item.get("status") == "unread"),
                 "costs": self._cost_snapshot(now),
@@ -568,6 +759,9 @@ class DesktopAutonomyManager:
         job.setdefault("network_result", {})
         job.setdefault("diff_preview", "")
         job.setdefault("feedback", "")
+        job.setdefault("package_id", "")
+        job.setdefault("post_action_review", "pending" if job.get("status") == "completed" else "not_required")
+        job.setdefault("intent_id", "")
         if job.get("status") == "queued" and not job.get("goal_id"):
             now = time.time()
             pseudo_project = {"project_id": project_id, "title": job.get("project_title", "未命名项目")}
@@ -577,6 +771,245 @@ class DesktopAutonomyManager:
             }
             goal = self._create_goal(pseudo_project, pseudo_opportunity, float(job["value_score"]), now)
             job["goal_id"] = goal["goal_id"]
+
+    def _migrate_legacy_queued_intents(self) -> int:
+        """Attach V6 traceability to unfinished V5 work without rewriting old history."""
+        migrated = 0
+        now = time.time()
+        for job in self._state["jobs"]:
+            if job.get("status") != "queued" or job.get("intent_id"):
+                continue
+            goal = next((item for item in self._state["goals"]
+                         if item.get("goal_id") == job.get("goal_id")), {})
+            grant = self._grant(str(job.get("grant_id", ""))) or {}
+            context = {
+                "context_snapshot_id": uuid.uuid4().hex,
+                "captured_at": now,
+                "time_text": datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M"),
+                "source": "v5_queue_migration",
+                "active_project_count": 1 if job.get("project_id") else 0,
+                "open_opportunity_count": 1,
+                "queued_job_count": sum(1 for item in self._state["jobs"] if item.get("status") == "queued"),
+                "active_grant_count": len(self._active_grants(now)),
+                "daily_created_count": self._daily_created_count(now),
+                "daily_file_limit": int(self._state["limits"]["max_files_per_day"]),
+                "circuit_status": self._state["circuit"].get("status", "closed"),
+                "project_ids": [str(job.get("project_id", ""))] if job.get("project_id") else [],
+            }
+            self._state["context_snapshots"].append(context)
+            intent = {
+                "intent_id": uuid.uuid4().hex,
+                "status": "authorized",
+                "project_id": str(job.get("project_id", "")),
+                "project_title": str(job.get("project_title", "未命名项目"))[:120],
+                "opportunity_id": str(job.get("opportunity_id", ""))[:80],
+                "kind": str(job.get("opportunity_kind", ""))[:80],
+                "title": str(job.get("title", "项目下一步"))[:160],
+                "objective": str(job.get("reason", "完成升级前尚未处理的工作"))[:600],
+                "why_now": "这是第五版遗留的未完成工作；升级后继续执行前补齐依据、权限和结果追踪",
+                "evidence": [str(item)[:500] for item in job.get("evidence", []) if str(item).strip()][:10],
+                "expected_benefit": self._expected_benefit(str(job.get("opportunity_kind", ""))),
+                "expression_hint": "认真接续之前答应主人的事情，不把遗留待办说成已经完成",
+                "risk": str(job.get("risk", "只创建可丢弃草稿"))[:500],
+                "completion_criteria": deepcopy(goal.get("completion_criteria", [])),
+                "score": float(job.get("value_score", 0.65)),
+                "score_breakdown": deepcopy(job.get("score_breakdown", {})),
+                "context_snapshot_id": context["context_snapshot_id"],
+                "grant_id": str(job.get("grant_id", "")),
+                "grant_name": str(grant.get("name", "升级前能力卡")),
+                "allowed_operations": deepcopy(grant.get("operations", ["create_draft"])),
+                "job_id": str(job.get("job_id", "")),
+                "package_id": str(job.get("package_id", "")),
+                "package_name": "",
+                "outcome": {},
+                "created_at": now,
+                "updated_at": now,
+                "history": [
+                    {"status": "proposed", "at": now, "reason": "从第五版未完成队列迁移"},
+                    {"status": "authorized", "at": now, "reason": "保留原能力卡与待执行状态，等待安全续做"},
+                ],
+            }
+            self._state["intents"].append(intent)
+            job["intent_id"] = intent["intent_id"]
+            self._journal("intent_migrated", intent, now, f"接续升级前尚未完成的“{intent['title']}”")
+            migrated += 1
+        self._state["context_snapshots"] = self._state["context_snapshots"][-120:]
+        self._state["intents"] = self._state["intents"][-300:]
+        return migrated
+
+    @staticmethod
+    def _migrate_intent(intent: dict[str, Any]) -> None:
+        intent.setdefault("status", "completed")
+        intent.setdefault("history", [])
+        intent.setdefault("context_snapshot_id", "")
+        intent.setdefault("grant_id", "")
+        intent.setdefault("job_id", "")
+        intent.setdefault("outcome", {})
+
+    def _capture_context(self, snapshot: dict[str, Any], now: float) -> dict[str, Any]:
+        projects = snapshot.get("projects", []) if isinstance(snapshot, dict) else []
+        active_projects = [item for item in projects if isinstance(item, dict) and not item.get("archived")]
+        open_opportunities = sum(len(item.get("open_opportunities", [])) for item in active_projects)
+        existing = next((item for item in reversed(self._state["context_snapshots"])
+                         if now - float(item.get("captured_at", 0.0)) < 60
+                         and int(item.get("active_project_count", -1)) == len(active_projects)
+                         and int(item.get("open_opportunity_count", -1)) == open_opportunities), None)
+        if existing:
+            return existing
+        context = {
+            "context_snapshot_id": uuid.uuid4().hex, "captured_at": now,
+            "time_text": datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M"),
+            "active_project_count": len(active_projects),
+            "open_opportunity_count": open_opportunities,
+            "queued_job_count": sum(1 for item in self._state["jobs"] if item.get("status") == "queued"),
+            "active_grant_count": len(self._active_grants(now)),
+            "daily_created_count": self._daily_created_count(now),
+            "daily_file_limit": int(self._state["limits"]["max_files_per_day"]),
+            "circuit_status": self._state["circuit"].get("status", "closed"),
+            "project_ids": [str(item.get("project_id", "")) for item in active_projects[:20]],
+        }
+        self._state["context_snapshots"].append(context)
+        self._state["context_snapshots"] = self._state["context_snapshots"][-120:]
+        return context
+
+    def _create_intent(self, project: dict[str, Any], opportunity: dict[str, Any], grant: dict[str, Any],
+                       score: float, breakdown: dict[str, Any], context: dict[str, Any],
+                       goal: dict[str, Any], now: float) -> dict[str, Any]:
+        intent = {
+            "intent_id": uuid.uuid4().hex, "status": "proposed",
+            "project_id": str(project.get("project_id", "")),
+            "project_title": str(project.get("title", "未命名项目"))[:120],
+            "opportunity_id": str(opportunity.get("opportunity_id", ""))[:80],
+            "kind": str(opportunity.get("kind", ""))[:80],
+            "title": str(opportunity.get("title", "项目下一步"))[:160],
+            "objective": str(opportunity.get("rationale", "补全项目下一步"))[:600],
+            "why_now": f"价值 {score:.2f}；有真实项目机会；当前有可用额度和匹配能力卡",
+            "evidence": [str(item)[:500] for item in opportunity.get("evidence", []) if str(item).strip()][:10],
+            "expected_benefit": self._expected_benefit(str(opportunity.get("kind", ""))),
+            "expression_hint": self._expression_hint(score, str(opportunity.get("kind", ""))),
+            "risk": str(opportunity.get("risk", "只创建可丢弃草稿"))[:500],
+            "completion_criteria": deepcopy(goal.get("completion_criteria", [])),
+            "score": score, "score_breakdown": deepcopy(breakdown),
+            "context_snapshot_id": context["context_snapshot_id"],
+            "grant_id": str(grant.get("grant_id", "")),
+            "grant_name": str(grant.get("name", "能力卡")),
+            "allowed_operations": deepcopy(grant.get("operations", [])),
+            "job_id": "", "outcome": {}, "created_at": now, "updated_at": now,
+            "history": [{"status": "proposed", "at": now, "reason": "从项目真实机会形成自主意图"}],
+        }
+        self._state["intents"].append(intent)
+        self._state["intents"] = self._state["intents"][-300:]
+        self._journal("intent_formed", intent, now, f"想为“{intent['project_title']}”做“{intent['title']}”")
+        return intent
+
+    @staticmethod
+    def _expected_benefit(kind: str) -> str:
+        return {
+            "presentation_review": "提前发现演示文稿结构、版式或来源问题",
+            "document_review": "在修改正式文档前形成可检查的问题清单",
+            "artifact_index": "减少主人重新查找项目产物的时间",
+            "safe_retry": "把失败原因与安全重试条件整理清楚",
+        }.get(kind, "为主人准备一个可检查、可丢弃的下一步草稿")
+
+    @staticmethod
+    def _expression_hint(score: float, kind: str) -> str:
+        if kind == "safe_retry":
+            return "谨慎，先把失败原因整理清楚再靠近主人"
+        if score >= 0.78:
+            return "有一点期待，希望给主人一个真正有用的小惊喜"
+        return "安静认真，不打断主人，只把结果准备好"
+
+    def _transition_intent(self, intent: dict[str, Any], status: str, now: float, reason: str,
+                           outcome: dict[str, Any] | None = None) -> None:
+        history = intent.setdefault("history", [])
+        if history and intent.get("status") == status and history[-1].get("reason") == str(reason)[:500]:
+            return
+        intent.update(status=status, updated_at=now)
+        if outcome is not None:
+            intent["outcome"] = deepcopy(outcome)
+        history.append({"status": status, "at": now, "reason": str(reason)[:500]})
+        intent["history"] = intent["history"][-30:]
+        self._journal(f"intent_{status}", intent, now, reason)
+
+    def _journal(self, event: str, intent: dict[str, Any], now: float, summary: str) -> None:
+        self._state["life_journal"].append({
+            "journal_id": uuid.uuid4().hex, "event": event, "at": now,
+            "time_text": datetime.fromtimestamp(now).strftime("%m-%d %H:%M"),
+            "intent_id": intent.get("intent_id", ""), "project_id": intent.get("project_id", ""),
+            "summary": " ".join(str(summary).split())[:300],
+        })
+        self._state["life_journal"] = self._state["life_journal"][-300:]
+
+    def _note_action_outcome(self, job: dict[str, Any], success: bool, now: float, error: str = "") -> None:
+        circuit = self._state["circuit"]
+        was_half_open = circuit.get("status") == "half_open"
+        if success:
+            circuit.update(status="closed", open_until=0.0, reason="", consecutive_failures=0,
+                           last_success_at=now)
+        else:
+            failures = int(circuit.get("consecutive_failures", 0)) + 1
+            circuit.update(consecutive_failures=failures, last_failure_at=now)
+            if failures >= 2 or was_half_open:
+                circuit.update(status="open", opened_at=now, open_until=now + 6 * 3600,
+                               reason=f"连续 {failures} 次自主行动失败：{str(error)[:180]}")
+                self._record("circuit.opened", "自主行动连续失败，已自动熔断六小时", now,
+                             job_id=job.get("job_id", ""), failures=failures)
+
+    def _circuit_allows(self, now: float) -> bool:
+        circuit = self._state["circuit"]
+        if circuit.get("status") == "open" and float(circuit.get("open_until", 0.0)) > now:
+            return False
+        if circuit.get("status") == "open":
+            circuit["status"] = "half_open"
+        return True
+
+    def _learn_trust(self, job: dict[str, Any], action: str, now: float) -> None:
+        key = self._preference_key(str(job.get("project_id", "")), str(job.get("opportunity_kind", "")))
+        trust = self._state["trust"].setdefault(key, {
+            "score": 0.5, "positive": 0, "negative": 0, "level": "observe", "seen_jobs": [],
+            "updated_at": now,
+        })
+        seen_jobs = trust.setdefault("seen_jobs", [])
+        job_id = str(job.get("job_id", ""))
+        if job_id in seen_jobs:
+            return
+        seen_jobs.append(job_id)
+        trust["seen_jobs"] = seen_jobs[-100:]
+        if action in ("adopt", "edited_adopt", "more"):
+            trust["positive"] = int(trust.get("positive", 0)) + 1
+        elif action in ("discard", "less", "never"):
+            trust["negative"] = int(trust.get("negative", 0)) + 1
+        positive, negative = int(trust["positive"]), int(trust["negative"])
+        score = (positive + 1) / (positive + negative + 2)
+        trust.update(score=round(score, 3), updated_at=now)
+        # Trust tunes frequency only after repeated evidence; it never grants a new operation.
+        if negative >= 2 or action == "never":
+            trust["level"] = "restricted"
+        elif positive >= 3 and negative == 0:
+            trust["level"] = "trusted_within_grant"
+        else:
+            trust["level"] = "observe"
+
+    def _matching_package(self, grant_id: str, project_id: str, now: float) -> dict[str, Any] | None:
+        return next((package for package in reversed(self._state["packages"])
+                     if package.get("status") == "active" and float(package.get("expires_at", 0.0)) > now
+                     and (not package.get("project_id") or package.get("project_id") == project_id)
+                     and grant_id in package.get("grant_ids", [])), None)
+
+    def _package_daily_limit(self, package: dict[str, Any], project_id: str, kind: str) -> int:
+        base = max(1, min(5, int(package.get("max_actions_per_day", 1))))
+        trust = self._state["trust"].get(self._preference_key(project_id, kind), {})
+        if trust.get("level") == "trusted_within_grant":
+            return min(5, base + 1)
+        if trust.get("level") == "restricted":
+            return 1
+        return base
+
+    def _package_daily_count(self, package_id: str, now: float) -> int:
+        day = datetime.fromtimestamp(now).strftime("%Y-%m-%d")
+        return sum(1 for job in self._state["jobs"] if job.get("package_id") == package_id
+                   and float(job.get("completed_at", 0.0)) > 0
+                   and datetime.fromtimestamp(float(job["completed_at"])).strftime("%Y-%m-%d") == day)
 
     @staticmethod
     def _fingerprint(project_id: str, kind: str, title: str) -> str:
@@ -708,7 +1141,13 @@ class DesktopAutonomyManager:
         weight = self._preference_weight(project_id, kind)
         if weight <= -0.9:
             return 2.0
-        return max(0.45, min(0.9, 0.62 - weight * 0.35))
+        trust = self._state["trust"].get(self._preference_key(project_id, kind), {})
+        trust_adjustment = 0.0
+        if trust.get("level") == "trusted_within_grant":
+            trust_adjustment = -0.04
+        elif trust.get("level") == "restricted":
+            trust_adjustment = 0.12
+        return max(0.45, min(0.9, 0.62 - weight * 0.35 + trust_adjustment))
 
     def _read_project_context(self, project: dict[str, Any], grant: dict[str, Any]) -> dict[str, Any]:
         if "read_project" not in grant.get("operations", []):
@@ -833,11 +1272,13 @@ class DesktopAutonomyManager:
     def _inbox(self, kind: str, job: dict[str, Any], now: float, message: str) -> None:
         self._state["inbox"].append({
             "inbox_id": uuid.uuid4().hex, "kind": kind, "status": "unread",
-            "job_id": str(job.get("job_id", "")), "project_id": str(job.get("project_id", "")),
+            "job_id": str(job.get("job_id", "")), "intent_id": str(job.get("intent_id", "")),
+            "package_id": str(job.get("package_id", "")), "project_id": str(job.get("project_id", "")),
             "project_title": str(job.get("project_title", "")), "title": str(job.get("title", "")),
             "message": str(message)[:500], "reason": str(job.get("reason", ""))[:500],
             "evidence": deepcopy(job.get("evidence", []))[:10], "value_score": job.get("value_score", 0.0),
             "review_score": (job.get("review", {}) or {}).get("score", 0.0), "created_at": now,
+            "post_action_review": str(job.get("post_action_review", "pending")),
         })
         self._state["inbox"] = self._state["inbox"][-200:]
 
@@ -919,6 +1360,9 @@ class DesktopAutonomyManager:
 
     def _grant(self, grant_id: str) -> dict[str, Any] | None:
         return next((grant for grant in self._state["grants"] if grant.get("grant_id") == grant_id), None)
+
+    def _intent(self, intent_id: str) -> dict[str, Any] | None:
+        return next((intent for intent in self._state["intents"] if intent.get("intent_id") == intent_id), None)
 
     def _job(self, job_id: str) -> dict[str, Any] | None:
         return next((job for job in self._state["jobs"] if job.get("job_id") == job_id), None)

@@ -259,6 +259,13 @@ public partial class MainWindow : Window
         public required string Display { get; init; }
     }
 
+    private sealed class AutonomyPackageViewItem
+    {
+        public required string Id { get; init; }
+        public required string Status { get; init; }
+        public required string Display { get; init; }
+    }
+
     [DllImport("user32.dll")]
     private static extern nint GetForegroundWindow();
 
@@ -996,11 +1003,53 @@ public partial class MainWindow : Window
         var createdToday = snapshot.TryGetProperty("created_today", out var todayElement) ? todayElement.GetInt32() : 0;
         var dailyLimit = snapshot.TryGetProperty("daily_limit", out var limitElement) ? limitElement.GetInt32() : 3;
         var unread = snapshot.TryGetProperty("unread_inbox_count", out var unreadElement) ? unreadElement.GetInt32() : 0;
+        var activeIntents = snapshot.TryGetProperty("active_intent_count", out var intentCountElement) ? intentCountElement.GetInt32() : 0;
+        var activePackages = snapshot.TryGetProperty("active_package_count", out var packageCountElement) ? packageCountElement.GetInt32() : 0;
         AutonomySummaryText.Text = !enabled ? "尚未授权 · 不会自主创建文件"
             : _autonomyPaused ? $"已暂停 · {activeGrants} 张有效能力卡"
-            : $"运行中 · {activeGrants} 张能力卡 · 队列 {queued} · 可采纳草稿 {drafts} · 未读 {unread}";
-        AutonomyBoundaryText.Text = $"今天已创建 {createdToday}/{dailyLimit} · L1/L2 · 路径、类型、大小、敏感内容与覆盖写入均在本地验证";
+            : $"运行中 · {activeGrants} 张能力卡 · {activePackages} 个权限包 · 意图 {activeIntents} · 队列 {queued} · 可采纳 {drafts} · 未读 {unread}";
+        AutonomyBoundaryText.Text = $"今天已创建 {createdToday}/{dailyLimit} · V6 情境→意图→权限→行动→复核 · 所有边界在本地验证";
         PauseAutonomyButton.Content = _autonomyPaused ? "恢复全部" : "暂停全部";
+
+        AutonomyIntentText.Text = "当前没有形成新的自主意图。";
+        if (snapshot.TryGetProperty("intents", out var intentArray) && intentArray.ValueKind == JsonValueKind.Array)
+        {
+            var intent = intentArray.EnumerateArray().FirstOrDefault();
+            if (intent.ValueKind == JsonValueKind.Object)
+            {
+                var status = intent.TryGetProperty("status", out var statusElement) ? statusElement.GetString() ?? "" : "";
+                var project = intent.TryGetProperty("project_title", out var projectElement) ? projectElement.GetString() ?? "项目" : "项目";
+                var title = intent.TryGetProperty("title", out var titleElement) ? titleElement.GetString() ?? "下一步" : "下一步";
+                var why = intent.TryGetProperty("why_now", out var whyElement) ? whyElement.GetString() ?? "" : "";
+                var benefit = intent.TryGetProperty("expected_benefit", out var benefitElement) ? benefitElement.GetString() ?? "" : "";
+                var expression = intent.TryGetProperty("expression_hint", out var expressionElement) ? expressionElement.GetString() ?? "" : "";
+                var risk = intent.TryGetProperty("risk", out var riskElement) ? riskElement.GetString() ?? "" : "";
+                var grant = intent.TryGetProperty("grant_name", out var grantElement) ? grantElement.GetString() ?? "能力卡" : "能力卡";
+                AutonomyIntentText.Text = $"{IntentStatusText(status)} · {project}\n想做：{title}\n为什么现在：{why}\n预期帮助：{benefit}\n此刻的样子：{expression}\n权限：{grant}\n风险边界：{risk}";
+            }
+        }
+
+        var selectedPackageId = (AutonomyPackageListBox.SelectedItem as AutonomyPackageViewItem)?.Id;
+        var packages = new List<AutonomyPackageViewItem>();
+        if (snapshot.TryGetProperty("packages", out var packageArray) && packageArray.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var package in packageArray.EnumerateArray())
+            {
+                var id = package.TryGetProperty("package_id", out var idElement) ? idElement.GetString() ?? "" : "";
+                var status = package.TryGetProperty("status", out var statusElement) ? statusElement.GetString() ?? "" : "";
+                var name = package.TryGetProperty("name", out var nameElement) ? nameElement.GetString() ?? "委托权限包" : "委托权限包";
+                var projectId = package.TryGetProperty("project_id", out var projectElement) ? projectElement.GetString() ?? "" : "";
+                var expires = package.TryGetProperty("expires_at", out var expiresElement) ? expiresElement.GetDouble() : 0;
+                var expiresText = expires > 0 ? DateTimeOffset.FromUnixTimeSeconds((long)expires).LocalDateTime.ToString("MM-dd") : "--";
+                packages.Add(new AutonomyPackageViewItem {
+                    Id = id, Status = status,
+                    Display = $"{(status == "active" ? "有效" : status)} · {name} · {(string.IsNullOrWhiteSpace(projectId) ? "轻量全局" : "指定项目")} · 至 {expiresText}"
+                });
+            }
+        }
+        AutonomyPackageListBox.ItemsSource = packages;
+        AutonomyPackageListBox.SelectedItem = packages.FirstOrDefault(item => item.Id == selectedPackageId) ?? packages.FirstOrDefault();
+        RevokePackageButton.IsEnabled = AutonomyPackageListBox.SelectedItem is AutonomyPackageViewItem packageItem && packageItem.Status == "active";
 
         var selectedGrantId = (AutonomyGrantListBox.SelectedItem as AutonomyGrantViewItem)?.Id;
         var grants = new List<AutonomyGrantViewItem>();
@@ -1091,9 +1140,12 @@ public partial class MainWindow : Window
                 var message = item.TryGetProperty("message", out var messageElement) ? messageElement.GetString() ?? "" : "";
                 var reason = item.TryGetProperty("reason", out var reasonElement) ? reasonElement.GetString() ?? "" : "";
                 var score = item.TryGetProperty("value_score", out var scoreElement) ? scoreElement.GetDouble() : 0;
+                var intentId = item.TryGetProperty("intent_id", out var intentElement) ? intentElement.GetString() ?? "" : "";
+                var packageId = item.TryGetProperty("package_id", out var packageElement) ? packageElement.GetString() ?? "" : "";
+                var reviewState = item.TryGetProperty("post_action_review", out var reviewStateElement) ? reviewStateElement.GetString() ?? "pending" : "pending";
                 inbox.Add(new AutonomyInboxViewItem {
                     Id = id, Display = $"{(status == "unread" ? "●" : "○")} {project}\n{message}",
-                    Detail = $"{message}\n\n主动依据：{reason}\n价值评分：{score:P0}"
+                    Detail = $"{message}\n\n主动依据：{reason}\n价值评分：{score:P0}\n意图：{ShortId(intentId)} · 权限包：{(string.IsNullOrWhiteSpace(packageId) ? "未使用" : ShortId(packageId))}\n事后确认：{(reviewState == "pending" ? "等待主人查看或反馈" : "已记录反馈")}"
                 });
             }
         }
@@ -1122,6 +1174,31 @@ public partial class MainWindow : Window
             AutonomyCostText.Text = $"今天网络读取 {requests} 次 / {bytes / 1024.0:F1} KB · 模型 Token {tokens}\n{explanation}";
         }
 
+        var trustEntries = snapshot.TryGetProperty("trust", out var trustObject) && trustObject.ValueKind == JsonValueKind.Object
+            ? trustObject.EnumerateObject().ToList() : [];
+        var trusted = trustEntries.Count(item => item.Value.TryGetProperty("level", out var level) && level.GetString() == "trusted_within_grant");
+        var restricted = trustEntries.Count(item => item.Value.TryGetProperty("level", out var level) && level.GetString() == "restricted");
+        var circuitStatus = "closed";
+        var circuitReason = "";
+        if (snapshot.TryGetProperty("circuit", out var circuit) && circuit.ValueKind == JsonValueKind.Object)
+        {
+            circuitStatus = circuit.TryGetProperty("status", out var circuitStatusElement) ? circuitStatusElement.GetString() ?? "closed" : "closed";
+            circuitReason = circuit.TryGetProperty("reason", out var reasonElement) ? reasonElement.GetString() ?? "" : "";
+        }
+        AutonomyTrustText.Text = $"信任学习：授权内可信 {trusted} 类 · 收紧 {restricted} 类；信任只调节频率，不会新增权限。\n熔断：{CircuitStatusText(circuitStatus)}{(string.IsNullOrWhiteSpace(circuitReason) ? "" : $" · {circuitReason}")}";
+        ResetCircuitButton.Visibility = circuitStatus is "open" or "half_open" ? Visibility.Visible : Visibility.Collapsed;
+        var journal = new List<AutonomyAuditViewItem>();
+        if (snapshot.TryGetProperty("life_journal", out var journalArray) && journalArray.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in journalArray.EnumerateArray().Take(30))
+            {
+                var when = item.TryGetProperty("time_text", out var whenElement) ? whenElement.GetString() ?? "" : "";
+                var summary = item.TryGetProperty("summary", out var summaryElement) ? summaryElement.GetString() ?? "" : "";
+                journal.Add(new AutonomyAuditViewItem { Display = $"{when} · {summary}" });
+            }
+        }
+        AutonomyLifeJournalListBox.ItemsSource = journal;
+
         var audit = new List<AutonomyAuditViewItem>();
         if (snapshot.TryGetProperty("audit", out var auditArray) && auditArray.ValueKind == JsonValueKind.Array)
         {
@@ -1142,6 +1219,21 @@ public partial class MainWindow : Window
         "completed" => "可采纳", "awaiting_adoption" => "等待权限确认", "adopted" => "已采纳",
         "discarded" => "已移到可恢复区", "failed" => "失败", "cancelled" => "已取消", _ => status,
     };
+
+    private static string IntentStatusText(string status) => status switch
+    {
+        "proposed" => "形成想法", "authorized" => "权限允许", "executing" => "正在行动",
+        "completed" => "已经完成", "failed" => "行动失败", "blocked" => "暂时停下",
+        "cancelled" => "主人已取消", _ => status,
+    };
+
+    private static string CircuitStatusText(string status) => status switch
+    {
+        "closed" => "正常", "open" => "已自动暂停", "half_open" => "等待一次安全试探", _ => status,
+    };
+
+    private static string ShortId(string value) => string.IsNullOrWhiteSpace(value)
+        ? "未关联" : value[..Math.Min(8, value.Length)];
 
     private void RenderProjects(JsonElement snapshot)
     {
@@ -3182,6 +3274,49 @@ public partial class MainWindow : Window
         AutonomyFeedbackText.Text = project is null
             ? "已授权 7 天的全局只读网络研究，每天最多 2 次。"
             : $"已授权“{project.Title}”进行 7 天只读网络研究，每天最多 2 次。";
+    }
+
+    private async Task GrantSelectedProjectPackageAsync(string mode)
+    {
+        if (ProjectListBox.SelectedItem is not ProjectViewItem project)
+        {
+            AutonomyFeedbackText.Text = "请先到“项目”页选中一个项目。";
+            return;
+        }
+        await SendAutonomyAsync(new {
+            type = "autonomy.package_grant", request_id = Guid.NewGuid().ToString("N"),
+            project_id = project.Id, mode, valid_days = 7,
+        });
+        AutonomyFeedbackText.Text = mode == "research_helper"
+            ? $"已为“{project.Title}”启用 7 天研究助手包：每天最多 1 次只读网络研究和 2 次低风险草稿。"
+            : $"已为“{project.Title}”启用 7 天项目陪跑包：只会在授权范围内准备可丢弃草稿。";
+    }
+
+    private async void GrantProjectPackageButton_Click(object sender, RoutedEventArgs e) =>
+        await GrantSelectedProjectPackageAsync("project_helper");
+
+    private async void GrantResearchPackageButton_Click(object sender, RoutedEventArgs e) =>
+        await GrantSelectedProjectPackageAsync("research_helper");
+
+    private async void RevokePackageButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (AutonomyPackageListBox.SelectedItem is not AutonomyPackageViewItem package || package.Status != "active") return;
+        await SendAutonomyAsync(new {
+            type = "autonomy.package_revoke", request_id = Guid.NewGuid().ToString("N"), package_id = package.Id,
+        });
+        AutonomyFeedbackText.Text = "委托权限包已撤销；由它单独创建的能力卡和待处理工作也一起取消了。";
+    }
+
+    private void AutonomyPackageListBox_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        if (RevokePackageButton is not null)
+            RevokePackageButton.IsEnabled = AutonomyPackageListBox.SelectedItem is AutonomyPackageViewItem package && package.Status == "active";
+    }
+
+    private async void ResetCircuitButton_Click(object sender, RoutedEventArgs e)
+    {
+        await SendAutonomyAsync(new { type = "autonomy.circuit_reset", request_id = Guid.NewGuid().ToString("N") });
+        AutonomyFeedbackText.Text = "自主行动熔断已经解除；下一次仍会完整检查情境、权限和安全边界。";
     }
 
     private async void PauseAutonomyButton_Click(object sender, RoutedEventArgs e) =>

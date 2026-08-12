@@ -30,7 +30,20 @@ if (-not $wpfNeedsBuild) {
         $_.Extension -in @('.cs', '.xaml') -or $_.Name -eq 'Unnameko.Desktop.csproj'
     } | Where-Object { $_.LastWriteTimeUtc -gt $wpfBuiltAt } | Select-Object -First 1)
 }
+$existingWindow = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    $_.Name -eq 'Unnameko.Desktop.exe' -and $_.ExecutablePath -eq $wpfExe
+})
 if ($wpfNeedsBuild) {
+    # The running apphost locks the Release executable on Windows. Only close
+    # this project's window when source is newer and a rebuild is actually
+    # required; the persistent core keeps state alive during the short update.
+    if ($existingWindow) {
+        $existingWindow | ForEach-Object {
+            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+        Start-Sleep -Milliseconds 300
+        $existingWindow = @()
+    }
     & $dotnet build $wpfProject -c Release --no-restore
     if ($LASTEXITCODE -ne 0) {
         throw "WPF build failed with code $LASTEXITCODE"
@@ -65,9 +78,9 @@ if (-not $existingCore) {
     Start-Sleep -Milliseconds 500
 }
 
-$existingWindow = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+$existingWindow = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
     $_.Name -eq 'Unnameko.Desktop.exe' -and $_.ExecutablePath -eq $wpfExe
-}
+})
 if (-not $existingWindow) {
     Start-Process -FilePath $wpfExe -WorkingDirectory $projectRoot
 }
