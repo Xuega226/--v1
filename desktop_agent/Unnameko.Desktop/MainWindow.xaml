@@ -112,6 +112,8 @@
                     </Border>
                 </StackPanel>
                 <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,0,12,0">
+                    <Button x:Name="SettingsNavButton" Content="⚙" ToolTip="设置与权限" Click="SettingsNavButton_Click"
+                            Style="{StaticResource WindowButton}" FontSize="14" />
                     <Button Content="◫" ToolTip="切换为桌宠模式" Click="TogglePetModeButton_Click"
                             Style="{StaticResource WindowButton}" FontSize="15" />
                     <Button Content="—" Click="HideButton_Click" Style="{StaticResource WindowButton}" />
@@ -176,29 +178,91 @@
                 </StackPanel>
             </Grid>
 
-            <Border Grid.Row="2" Margin="18,0,18,10" Height="1" Background="#2778A98C" />
+            <Grid Grid.Row="2" Margin="18,0,18,9">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="1" />
+                    <RowDefinition Height="36" />
+                </Grid.RowDefinitions>
+                <Border Background="#2778A98C" />
+                <Grid Grid.Row="1" Margin="0,6,0,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <Button x:Name="CompanionNavButton" Content="陪伴" Width="66" Height="28"
+                            Margin="0,0,6,0" Click="CompanionNavButton_Click" />
+                    <Button x:Name="WorkNavButton" Grid.Column="1" Content="工作" Width="66" Height="28"
+                            Margin="0,0,6,0" Click="WorkNavButton_Click" />
+                    <Button x:Name="MemoryNavButton" Grid.Column="2" Content="记忆" Width="66" Height="28"
+                            Click="MemoryNavButton_Click" />
+                    <TextBlock x:Name="NavigationContextText" Grid.Column="3" Margin="9,0,0,0"
+                               VerticalAlignment="Center" FontSize="10" Foreground="{StaticResource SubtleBrush}" />
+                </Grid>
+            </Grid>
 
-            <TabControl x:Name="MainTabs" Grid.Row="3" Margin="18,0,18,12" Background="Transparent" BorderThickness="0">
+            <TabControl x:Name="MainTabs" Grid.Row="3" Margin="18,0,18,12" Background="Transparent"
+                        BorderThickness="0" SelectionChanged="MainTabs_SelectionChanged">
+                <TabControl.Template>
+                    <ControlTemplate TargetType="TabControl">
+                        <ContentPresenter Content="{TemplateBinding SelectedContent}"
+                                          ContentTemplate="{TemplateBinding SelectedContentTemplate}"
+                                          ContentStringFormat="{TemplateBinding SelectedContentStringFormat}" />
+                    </ControlTemplate>
+                </TabControl.Template>
                 <TabItem Header="对话">
                     <Border CornerRadius="16" Background="#AFFFFFFF" BorderBrush="#2078A98C" BorderThickness="1">
-                        <ScrollViewer x:Name="ChatScroller" VerticalScrollBarVisibility="Auto" Padding="14">
-                            <TextBlock x:Name="ChatText" TextWrapping="Wrap" Foreground="{StaticResource InkBrush}"
-                                       FontSize="14" LineHeight="23">
-                                <Run Text="未名子&#x0a;" FontWeight="SemiBold" Foreground="#668E76" />
-                                <Run Text="主人，我已经醒着啦。窗口重开也不会让我忘记刚才发生的事，喵。" />
-                            </TextBlock>
-                        </ScrollViewer>
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="*" />
+                            </Grid.RowDefinitions>
+                            <Border Padding="10,7" BorderBrush="#2078A98C" BorderThickness="0,0,0,1">
+                                <DockPanel>
+                                    <Button Content="添加桌面上下文" Width="104" Height="25"
+                                            DockPanel.Dock="Right" Click="OpenPerceptionDetailButton_Click" />
+                                    <TextBlock Text="和未名子说说话" VerticalAlignment="Center" FontSize="11"
+                                               Foreground="{StaticResource SubtleBrush}" />
+                                </DockPanel>
+                            </Border>
+                            <ScrollViewer x:Name="ChatScroller" Grid.Row="1" VerticalScrollBarVisibility="Auto" Padding="14">
+                                <TextBlock x:Name="ChatText" TextWrapping="Wrap" Foreground="{StaticResource InkBrush}"
+                                           FontSize="14" LineHeight="23">
+                                    <Run Text="未名子&#x0a;" FontWeight="SemiBold" Foreground="#668E76" />
+                                    <Run Text="主人，我已经醒着啦。窗口重开也不会让我忘记刚才发生的事，喵。" />
+                                </TextBlock>
+                            </ScrollViewer>
+                        </Grid>
                     </Border>
                 </TabItem>
                 <TabItem Header="任务">
                     <Border CornerRadius="16" Background="#AFFFFFFF" BorderBrush="#2078A98C" BorderThickness="1">
                         <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="13">
                             <StackPanel>
-                                <TextBlock Text="告诉未名子一个目标" FontWeight="SemiBold" FontSize="15"
+                                <TextBlock Text="工作" FontWeight="SemiBold" FontSize="15"
                                            Foreground="{StaticResource InkBrush}" />
-                                <TextBlock Text="未名子会先生成完整计划给主人预览；确认计划后，仍会在每个写入步骤前单独请求许可。"
-                                           Margin="0,4,0,10" FontSize="11" TextWrapping="Wrap"
-                                           Foreground="{StaticResource SubtleBrush}" />
+                                <TextBlock Text="目标、计划、进行中的任务、项目下一步和她准备的草稿都从这里进入。"
+                                            Margin="0,4,0,10" FontSize="11" TextWrapping="Wrap"
+                                            Foreground="{StaticResource SubtleBrush}" />
+                                <Border Padding="10" CornerRadius="12" Background="#EFF7F1"
+                                        BorderBrush="#5078A98C" BorderThickness="1" Margin="0,0,0,11">
+                                    <StackPanel>
+                                        <TextBlock x:Name="WorkOverviewText" Text="正在整理当前工作…"
+                                                   FontWeight="SemiBold" Foreground="#426C52" TextWrapping="Wrap" />
+                                        <TextBlock x:Name="WorkAttentionText" Margin="0,4,0,7" FontSize="10"
+                                                   Foreground="#66806E" TextWrapping="Wrap"
+                                                   Text="没有需要主人立即处理的事项。" />
+                                        <WrapPanel>
+                                            <Button Content="项目与下一步" Width="94" Height="26" Margin="0,0,6,0"
+                                                    Click="OpenProjectsDetailButton_Click" />
+                                            <Button Content="自主草稿与依据" Width="108" Height="26"
+                                                    Click="OpenAutonomyDetailButton_Click" />
+                                        </WrapPanel>
+                                    </StackPanel>
+                                </Border>
+                                <TextBlock Text="交给她一个目标" FontWeight="SemiBold" FontSize="13"
+                                           Foreground="{StaticResource InkBrush}" Margin="0,0,0,6" />
                                 <TextBox x:Name="GoalTextBox" Margin="0,0,0,8" Padding="8,6" Height="68"
                                          AcceptsReturn="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" />
                                 <Button x:Name="CreateGoalPlanButton" Content="生成计划预览" Height="32"
@@ -473,6 +537,10 @@
                             <TextBlock Text="主人可以查看、修订、置顶或彻底遗忘。删除操作无法自动恢复。"
                                        Margin="0,4,0,9" FontSize="11" TextWrapping="Wrap"
                                        Foreground="{StaticResource SubtleBrush}" />
+                            <DockPanel>
+                                <TextBox x:Name="MemorySearchBox" Width="155" Height="27" Padding="7,3"
+                                         DockPanel.Dock="Right" ToolTip="搜索当前分类"
+                                         TextChanged="MemorySearchBox_TextChanged" />
                             <StackPanel Orientation="Horizontal">
                                 <ComboBox x:Name="MemoryStatusBox" Width="125" SelectedIndex="0"
                                           SelectionChanged="MemoryStatusBox_SelectionChanged">
@@ -482,6 +550,7 @@
                                 </ComboBox>
                                 <Button Content="刷新" Width="58" Margin="7,0,0,0" Click="RefreshMemoriesButton_Click" />
                             </StackPanel>
+                            </DockPanel>
                             <Grid Height="185" Margin="0,8,0,0">
                                 <ListBox x:Name="MemoryListBox"
                                          DisplayMemberPath="Display" SelectionChanged="MemoryListBox_SelectionChanged"
@@ -494,18 +563,22 @@
                                            Margin="24" FontSize="12" Foreground="#7A807B"
                                            IsHitTestVisible="False" Visibility="Collapsed" />
                             </Grid>
-                            <TextBlock Text="修订内容" Margin="0,9,0,3" FontSize="11"
-                                       Foreground="{StaticResource SubtleBrush}" />
-                            <TextBox x:Name="MemoryEditBox" Height="76" Padding="7,5" AcceptsReturn="True"
-                                     TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" />
-                            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,7,0,0">
-                                <Button Content="置顶/取消" Width="75" Height="27" Margin="0,0,6,0"
-                                        Click="ToggleMemoryPinButton_Click" />
-                                <Button Content="彻底遗忘" Width="70" Height="27" Margin="0,0,6,0"
-                                        Click="ForgetMemoryButton_Click" />
-                                <Button Content="保存修订" Width="70" Height="27" Click="ReviseMemoryButton_Click"
-                                        Background="#78A98C" Foreground="White" BorderThickness="0" />
-                            </StackPanel>
+                            <Expander Header="管理选中记忆" Margin="0,8,0,0">
+                                <StackPanel Margin="0,6,0,0">
+                                    <TextBlock Text="修订内容" Margin="0,0,0,3" FontSize="11"
+                                               Foreground="{StaticResource SubtleBrush}" />
+                                    <TextBox x:Name="MemoryEditBox" Height="76" Padding="7,5" AcceptsReturn="True"
+                                             TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" />
+                                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,7,0,0">
+                                        <Button Content="置顶/取消" Width="75" Height="27" Margin="0,0,6,0"
+                                                Click="ToggleMemoryPinButton_Click" />
+                                        <Button Content="彻底遗忘" Width="70" Height="27" Margin="0,0,6,0"
+                                                Click="ForgetMemoryButton_Click" />
+                                        <Button Content="保存修订" Width="70" Height="27" Click="ReviseMemoryButton_Click"
+                                                Background="#78A98C" Foreground="White" BorderThickness="0" />
+                                    </StackPanel>
+                                </StackPanel>
+                            </Expander>
                             <TextBlock x:Name="MemoryFeedbackText" Margin="0,7,0,0" FontSize="11"
                                        TextWrapping="Wrap" Foreground="{StaticResource SubtleBrush}" />
                         </StackPanel>
@@ -852,6 +925,85 @@
                     </Button.Template>
                 </Button>
             </Grid>
+        </Grid>
+    </Border>
+
+    <Border x:Name="SettingsScrim" Panel.ZIndex="70" Margin="14" CornerRadius="26"
+            Background="#240F1A13" Visibility="Collapsed"
+            MouseLeftButtonDown="SettingsScrim_MouseLeftButtonDown" />
+    <Border x:Name="SettingsDrawer" Panel.ZIndex="80" Width="350" Margin="0,62,18,74"
+            HorizontalAlignment="Right" VerticalAlignment="Stretch" CornerRadius="20"
+            Background="#FCFFFE" BorderBrush="#7078A98C" BorderThickness="1"
+            Visibility="Collapsed">
+        <Border.Effect>
+            <DropShadowEffect Color="#50142319" BlurRadius="18" ShadowDepth="4" Opacity="0.4" />
+        </Border.Effect>
+        <Grid Margin="15">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+            </Grid.RowDefinitions>
+            <DockPanel Margin="0,0,0,10">
+                <Button Content="×" Width="28" Height="28" DockPanel.Dock="Right"
+                        Click="CloseSettingsDrawerButton_Click" />
+                <StackPanel>
+                    <TextBlock Text="设置与权限" FontSize="16" FontWeight="SemiBold"
+                               Foreground="{StaticResource InkBrush}" />
+                    <TextBlock Text="日常面板只保留常用入口；详细权限仍可随时检查。"
+                               Margin="0,3,0,0" FontSize="10" Foreground="{StaticResource SubtleBrush}" />
+                </StackPanel>
+            </DockPanel>
+            <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+                <StackPanel>
+                    <Border Padding="11" CornerRadius="12" Background="#EFF7F1"
+                            BorderBrush="#4078A98C" BorderThickness="1">
+                        <StackPanel>
+                            <TextBlock Text="主动陪伴" FontWeight="SemiBold" Foreground="#426C52" />
+                            <TextBlock x:Name="SettingsProactiveSummaryText" Margin="0,4,0,7"
+                                       FontSize="10" TextWrapping="Wrap" Foreground="#66806E"
+                                       Text="正在读取主动陪伴状态…" />
+                            <WrapPanel>
+                                <Button Content="调整节奏" Width="76" Height="26" Margin="0,0,6,0"
+                                        Click="OpenProactiveSettingsButton_Click" />
+                                <Button Content="今天安静" Width="70" Height="26"
+                                        Click="QuietTodayButton_Click" />
+                            </WrapPanel>
+                        </StackPanel>
+                    </Border>
+                    <Border Padding="11" CornerRadius="12" Background="#F6F9F6" Margin="0,9,0,0"
+                            BorderBrush="#3078A98C" BorderThickness="1">
+                        <StackPanel>
+                            <TextBlock Text="自主权限" FontWeight="SemiBold" Foreground="#426C52" />
+                            <TextBlock x:Name="SettingsAutonomySummaryText" Margin="0,4,0,7"
+                                       FontSize="10" TextWrapping="Wrap" Foreground="#66806E"
+                                       Text="正在读取自主权限…" />
+                            <Button Content="管理项目助手、研究权限和草稿" Height="27"
+                                    Click="OpenAutonomySettingsButton_Click" />
+                        </StackPanel>
+                    </Border>
+                    <Border Padding="11" CornerRadius="12" Background="#F6F9F6" Margin="0,9,0,0"
+                            BorderBrush="#3078A98C" BorderThickness="1">
+                        <StackPanel>
+                            <TextBlock Text="桌面感知" FontWeight="SemiBold" Foreground="#426C52" />
+                            <TextBlock x:Name="SettingsPerceptionSummaryText" Margin="0,4,0,7"
+                                       FontSize="10" TextWrapping="Wrap" Foreground="#66806E"
+                                       Text="陪伴模式 · 只发送整理后的文字摘要" />
+                            <Button Content="添加上下文或管理感知权限" Height="27"
+                                    Click="OpenPerceptionDetailButton_Click" />
+                        </StackPanel>
+                    </Border>
+                    <Border Padding="11" CornerRadius="12" Background="#FFF9EE" Margin="0,9,0,0"
+                            BorderBrush="#40C49A50" BorderThickness="1">
+                        <StackPanel>
+                            <TextBlock Text="高级诊断" FontWeight="SemiBold" Foreground="#765F38" />
+                            <TextBlock Text="能力卡、仲裁成本、信任、生活日志、熔断和审计记录仍完整保留。"
+                                       Margin="0,4,0,7" FontSize="10" TextWrapping="Wrap" Foreground="#806F52" />
+                            <Button Content="查看自主性高级详情" Height="27"
+                                    Click="OpenAutonomyDetailButton_Click" />
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
+            </ScrollViewer>
         </Grid>
     </Border>
 

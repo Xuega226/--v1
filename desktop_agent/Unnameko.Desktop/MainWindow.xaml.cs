@@ -95,6 +95,16 @@ public partial class MainWindow : Window
     private string _pendingSourceOpportunityId = string.Empty;
     private string _autonomyDraftsDir = string.Empty;
     private bool _autonomyPaused;
+    private int _workTaskCount;
+    private int _workActiveTaskCount;
+    private int _workApprovalCount;
+    private int _workProjectCount;
+    private int _workOpportunityCount;
+    private int _workAutonomyQueued;
+    private int _workAutonomyDrafts;
+    private int _workAutonomyIntents;
+    private int _workAutonomyUnread;
+    private readonly List<MemoryViewItem> _loadedMemories = [];
 
     private enum BubbleKind
     {
@@ -349,6 +359,9 @@ public partial class MainWindow : Window
             ScheduleNextIdleGesture();
             _idleGestureTimer.Start();
             _presenceTimer.Start();
+            UpdateNavigationState();
+            UpdateWorkOverview();
+            UpdatePerceptionSettingsSummary();
             InputBox.Focus();
         };
         Closing += (_, e) =>
@@ -1009,6 +1022,16 @@ public partial class MainWindow : Window
             : _autonomyPaused ? $"已暂停 · {activeGrants} 张有效能力卡"
             : $"运行中 · {activeGrants} 张能力卡 · {activePackages} 个权限包 · 意图 {activeIntents} · 队列 {queued} · 可采纳 {drafts} · 未读 {unread}";
         AutonomyBoundaryText.Text = $"今天已创建 {createdToday}/{dailyLimit} · V6 情境→意图→权限→行动→复核 · 所有边界在本地验证";
+        _workAutonomyQueued = queued;
+        _workAutonomyDrafts = drafts;
+        _workAutonomyIntents = activeIntents;
+        _workAutonomyUnread = unread;
+        SettingsAutonomySummaryText.Text = !enabled
+            ? "未启用自主草稿；她只会在主人明确发起任务时行动。"
+            : _autonomyPaused
+                ? $"已暂停 · {activeGrants} 张有效能力卡"
+                : $"运行中 · {activePackages} 个权限包 · {activeIntents} 个当前意图 · {queued} 项待处理";
+        UpdateWorkOverview();
         PauseAutonomyButton.Content = _autonomyPaused ? "恢复全部" : "暂停全部";
 
         AutonomyIntentText.Text = "当前没有形成新的自主意图。";
@@ -1318,6 +1341,9 @@ public partial class MainWindow : Window
         ProjectSummaryText.Text = projects.Count == 0
             ? "目前还没有项目；建立目标或任务后会自动形成连续档案。"
             : $"共 {projects.Count} 个项目 · 进行中 {activeCount} · 待决定建议 {opportunityCount}";
+        _workProjectCount = activeCount;
+        _workOpportunityCount = opportunityCount;
+        UpdateWorkOverview();
     }
 
     private static string ProjectStatusText(string status) => status switch
@@ -1356,6 +1382,7 @@ public partial class MainWindow : Window
         ProactiveTimingText.Text = temporaryQuiet > DateTimeOffset.Now.ToUnixTimeSeconds()
             ? $"临时安静到 {temporaryQuietText}"
             : quiet ? $"现在处于静默时间 · 下次允许：{next}" : $"下次允许主动出现：{next}";
+        SettingsProactiveSummaryText.Text = $"{ProactiveSummaryText.Text} · {ProactiveTimingText.Text}";
         var items = new List<ProactiveViewItem>();
         if (snapshot.TryGetProperty("open_loops", out var openLoops) && openLoops.ValueKind == JsonValueKind.Array)
         {
@@ -1551,12 +1578,29 @@ public partial class MainWindow : Window
                     items.Add(new MemoryViewItem { Id = id, Content = content, Pinned = pinned });
             }
         }
+        _loadedMemories.Clear();
+        _loadedMemories.AddRange(items);
+        ApplyMemoryFilter(selectedId);
+    }
+
+    private void MemorySearchBox_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e) =>
+        ApplyMemoryFilter((MemoryListBox.SelectedItem as MemoryViewItem)?.Id);
+
+    private void ApplyMemoryFilter(string? selectedId = null)
+    {
+        if (MemoryListBox is null) return;
+        var query = MemorySearchBox?.Text.Trim() ?? string.Empty;
+        var items = string.IsNullOrWhiteSpace(query)
+            ? _loadedMemories.ToList()
+            : _loadedMemories.Where(item => item.Content.Contains(query, StringComparison.OrdinalIgnoreCase)).ToList();
         MemoryListBox.ItemsSource = items;
         MemoryListBox.SelectedItem = items.FirstOrDefault(item => item.Id == selectedId) ?? items.FirstOrDefault();
         MemoryEmptyText.Visibility = items.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         MemoryEditBox.IsEnabled = items.Count > 0;
         if (items.Count == 0) MemoryEditBox.Clear();
-        MemoryFeedbackText.Text = items.Count == 0 ? "这个分类里暂时没有记忆。" : $"共显示 {items.Count} 条记忆。";
+        MemoryFeedbackText.Text = items.Count == 0
+            ? (string.IsNullOrWhiteSpace(query) ? "这个分类里暂时没有记忆。" : "没有找到匹配的记忆。")
+            : $"共显示 {items.Count} 条记忆。";
     }
 
     private void UpdateAvatarState(double energy, bool working)
@@ -2056,6 +2100,9 @@ public partial class MainWindow : Window
         if (tasks.ValueKind != JsonValueKind.Array || tasks.GetArrayLength() == 0)
         {
             TaskListBox.ItemsSource = Array.Empty<TaskViewItem>();
+            _workTaskCount = 0;
+            _workActiveTaskCount = 0;
+            UpdateWorkOverview();
             return;
         }
         var items = new List<TaskViewItem>();
@@ -2100,6 +2147,9 @@ public partial class MainWindow : Window
         }
         TaskListBox.ItemsSource = items;
         TaskListBox.SelectedItem = items.FirstOrDefault(item => item.Id == selectedId) ?? items.FirstOrDefault();
+        _workTaskCount = items.Count;
+        _workActiveTaskCount = items.Count(item => item.Status is "draft" or "waiting_approval" or "running" or "paused");
+        UpdateWorkOverview();
     }
 
     private void RestoreDraftPlan(JsonElement tasks)
@@ -2343,6 +2393,8 @@ public partial class MainWindow : Window
             }
         }
         ApprovalCard.Visibility = Visibility.Visible;
+        _workApprovalCount = 1;
+        UpdateWorkOverview();
     }
 
     private void HideApproval()
@@ -2354,6 +2406,8 @@ public partial class MainWindow : Window
         PresentationPreviewImage.Source = null;
         PresentationApprovalPreview.Visibility = Visibility.Collapsed;
         ApprovalCard.Visibility = Visibility.Collapsed;
+        _workApprovalCount = 0;
+        UpdateWorkOverview();
     }
 
     private static string PresentationTemplateLabel(string? template) => template switch
@@ -2830,6 +2884,7 @@ public partial class MainWindow : Window
         var anchorRight = Left + ActualWidth;
         var anchorBottom = Top + ActualHeight;
         _petMode = enabled;
+        if (enabled) CloseSettingsDrawer();
         FullPanelRoot.Visibility = enabled ? Visibility.Collapsed : Visibility.Visible;
         PetModeRoot.Visibility = enabled ? Visibility.Visible : Visibility.Collapsed;
         Width = enabled ? 300 : 460;
@@ -2851,6 +2906,119 @@ public partial class MainWindow : Window
     }
 
     private void TogglePetModeButton_Click(object sender, RoutedEventArgs e) => SetPetMode(!_petMode);
+
+    private void NavigateToSection(int index, string context = "")
+    {
+        CloseSettingsDrawer();
+        SetPetMode(false);
+        MainTabs.SelectedIndex = index;
+        UpdateNavigationState();
+        if (!string.IsNullOrWhiteSpace(context)) NavigationContextText.Text = context;
+        if (index == 0) InputBox.Focus();
+    }
+
+    private void CompanionNavButton_Click(object sender, RoutedEventArgs e) => NavigateToSection(0);
+
+    private void WorkNavButton_Click(object sender, RoutedEventArgs e) => NavigateToSection(1);
+
+    private void MemoryNavButton_Click(object sender, RoutedEventArgs e) => NavigateToSection(3);
+
+    private void MainTabs_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        if (!IsLoaded || !ReferenceEquals(e.Source, MainTabs)) return;
+        UpdateNavigationState();
+    }
+
+    private void UpdateNavigationState()
+    {
+        if (CompanionNavButton is null) return;
+        var index = MainTabs.SelectedIndex;
+        ApplyNavigationButtonState(CompanionNavButton, index == 0);
+        ApplyNavigationButtonState(WorkNavButton, index is 1 or 2 or 5);
+        ApplyNavigationButtonState(MemoryNavButton, index == 3);
+        ApplyNavigationButtonState(SettingsNavButton, index is 4 or 6 || SettingsDrawer.Visibility == Visibility.Visible);
+        NavigationContextText.Text = index switch
+        {
+            2 => "工作详情 · 项目与下一步",
+            4 => "设置详情 · 主动陪伴",
+            5 => "工作详情 · 自主草稿与依据",
+            6 => "设置详情 · 桌面感知",
+            _ => string.Empty,
+        };
+    }
+
+    private static void ApplyNavigationButtonState(System.Windows.Controls.Button button, bool selected)
+    {
+        button.Background = new SolidColorBrush((System.Windows.Media.Color)
+            System.Windows.Media.ColorConverter.ConvertFromString(selected ? "#78A98C" : "#F3F8F4"));
+        button.Foreground = new SolidColorBrush((System.Windows.Media.Color)
+            System.Windows.Media.ColorConverter.ConvertFromString(selected ? "#FFFFFF" : "#52685A"));
+        button.BorderBrush = new SolidColorBrush((System.Windows.Media.Color)
+            System.Windows.Media.ColorConverter.ConvertFromString(selected ? "#78A98C" : "#4078A98C"));
+    }
+
+    private void OpenSettingsDrawer()
+    {
+        SetPetMode(false);
+        SettingsScrim.Visibility = Visibility.Visible;
+        SettingsDrawer.Visibility = Visibility.Visible;
+        UpdateNavigationState();
+    }
+
+    private void CloseSettingsDrawer()
+    {
+        if (SettingsDrawer is null) return;
+        SettingsDrawer.Visibility = Visibility.Collapsed;
+        SettingsScrim.Visibility = Visibility.Collapsed;
+        UpdateNavigationState();
+    }
+
+    private void SettingsNavButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (SettingsDrawer.Visibility == Visibility.Visible) CloseSettingsDrawer();
+        else OpenSettingsDrawer();
+    }
+
+    private void SettingsScrim_MouseLeftButtonDown(object sender, MouseButtonEventArgs e) => CloseSettingsDrawer();
+
+    private void CloseSettingsDrawerButton_Click(object sender, RoutedEventArgs e) => CloseSettingsDrawer();
+
+    private void OpenProjectsDetailButton_Click(object sender, RoutedEventArgs e) =>
+        NavigateToSection(2, "工作详情 · 项目与下一步");
+
+    private void OpenAutonomyDetailButton_Click(object sender, RoutedEventArgs e) =>
+        NavigateToSection(5, "工作详情 · 自主草稿与依据");
+
+    private void OpenAutonomySettingsButton_Click(object sender, RoutedEventArgs e) =>
+        NavigateToSection(5, "设置详情 · 自主权限与安全");
+
+    private void OpenProactiveSettingsButton_Click(object sender, RoutedEventArgs e) =>
+        NavigateToSection(4, "设置详情 · 主动陪伴");
+
+    private void OpenPerceptionDetailButton_Click(object sender, RoutedEventArgs e) =>
+        NavigateToSection(6, "设置详情 · 桌面感知");
+
+    private void UpdateWorkOverview()
+    {
+        if (WorkOverviewText is null) return;
+        var segments = new List<string>();
+        if (_workActiveTaskCount > 0) segments.Add($"进行中任务 {_workActiveTaskCount}");
+        if (_workApprovalCount > 0) segments.Add($"待确认 {_workApprovalCount}");
+        if (_workProjectCount > 0) segments.Add($"进行中项目 {_workProjectCount}");
+        if (_workOpportunityCount > 0) segments.Add($"下一步建议 {_workOpportunityCount}");
+        if (_workAutonomyQueued > 0) segments.Add($"自主待办 {_workAutonomyQueued}");
+        if (_workAutonomyDrafts > 0) segments.Add($"可查看草稿 {_workAutonomyDrafts}");
+        WorkOverviewText.Text = segments.Count == 0
+            ? "现在没有正在推进的工作，主人可以直接交给我一个目标。"
+            : string.Join(" · ", segments);
+        WorkAttentionText.Text = _workApprovalCount > 0
+            ? "有一步操作需要主人确认；没有许可就不会继续写入。"
+            : _workAutonomyUnread > 0
+                ? $"有 {_workAutonomyUnread} 条自主结果还没有查看。"
+                : _workOpportunityCount > 0
+                    ? $"她根据真实项目整理了 {_workOpportunityCount} 个可选下一步。"
+                    : $"共保留 {_workTaskCount} 条最近任务记录；目前没有需要主人立即处理的事项。";
+    }
 
     private void PetAvatar_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
@@ -3800,6 +3968,22 @@ public partial class MainWindow : Window
         _pausePerceptionItem.Text = _perceptionPolicy.Paused ? "恢复桌面感知" : "暂停桌面感知";
         _pausePerceptionItem.Checked = _perceptionPolicy.Paused;
         UpdatePerceptionIndicator();
+        UpdatePerceptionSettingsSummary();
+    }
+
+    private void UpdatePerceptionSettingsSummary()
+    {
+        if (SettingsPerceptionSummaryText is null) return;
+        var mode = _perceptionPolicy.Mode switch
+        {
+            PerceptionMode.Privacy => "隐私模式",
+            PerceptionMode.Agent => "Agent 模式",
+            _ => "陪伴模式",
+        };
+        var delivery = _perceptionPolicy.SendSummariesToModel ? "整理后的文字摘要可随聊天发送" : "仅在本地预览";
+        SettingsPerceptionSummaryText.Text = _perceptionPolicy.Paused
+            ? $"{mode} · 当前已暂停"
+            : $"{mode} · {delivery}";
     }
 
     private void SavePerceptionPolicyButton_Click(object sender, RoutedEventArgs e)
