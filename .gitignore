@@ -18,3 +18,5 @@ venv/
 
 # Gradio / temp
 *.log
+qq_sessions/
+qq_workspace/embedding_models/

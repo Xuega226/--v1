@@ -5,12 +5,15 @@
 """
 
 import concurrent.futures
+import base64
+from collections import deque
 import json
 import re
 import threading
 import time
 import urllib.request
 import urllib.error
+import uuid
 from websocket import WebSocketApp, WebSocketConnectionClosedException
 from config import (
     QQ_BOT_WS_URL,
@@ -21,6 +24,89 @@ from config import (
 
 # CQ 码正则：[CQ:type,key=val,...]
 _CQ_RE = re.compile(r"\[CQ:\w+[^\]]*\]")
+# 用于解析 CQ 码的 key=value
+_CQ_ARG_RE = re.compile(r"(\w+)=([^,\]]+)")
+_MAX_IMAGE_BYTES = 10 * 1024 * 1024
+_IMAGE_USER_AGENT = "UnnamekoQQ (QQ:3515419386)"
+
+
+def _parse_to_segments(text: str) -> list:
+    """将含 CQ 码的文本解析为 OneBot message 段数组。
+
+    [CQ:face,id=66] → {"type":"face","data":{"id":"66"}}
+    [CQ:image,file=url] → {"type":"image","data":{"file":"url"}}
+    其他文本 → {"type":"text","data":{"text":"..."}}
+    """
+    segments = []
+    pos = 0
+    for m in _CQ_RE.finditer(text):
+        # CQ 码之前的文本
+        if m.start() > pos:
+            segments.append({"type": "text", "data": {"text": text[pos:m.start()]}})
+
+        raw = m.group()
+        # 提取 type
+        cq_type = raw[4:raw.index(",")] if "," in raw else raw[4:raw.index("]")]
+        # 提取 key=value 对
+        data = {}
+        for am in _CQ_ARG_RE.finditer(raw):
+            data[am.group(1)] = am.group(2)
+
+        # face 小黄脸已禁用，直接跳过不发送
+        if cq_type == "face":
+            pass  # 丢弃 QQ 小黄脸
+        elif cq_type == "image":
+            # 普通图片不要附带 flash；NapCat 的闪照支持因版本而异，可能直接发送失败。
+            image_file = data.get("file", data.get("url", ""))
+            if image_file:
+                segments.append({"type": "image", "data": {"file": image_file}})
+        elif cq_type == "at":
+            segments.append({"type": "at", "data": {"qq": str(data.get("qq", ""))}})
+        elif cq_type == "reply":
+            reply_id = data.get("id", "")
+            if reply_id:
+                segments.append({"type": "reply", "data": {"id": str(reply_id)}})
+        elif cq_type == "record":
+            segments.append({"type": "record", "data": {"file": data.get("file", data.get("url", ""))}})
+        else:
+            # 其它 CQ 码保留原文
+            segments.append({"type": "text", "data": {"text": raw}})
+
+        pos = m.end()
+
+    # 尾部剩余文本
+    if pos < len(text):
+        segments.append({"type": "text", "data": {"text": text[pos:]}})
+
+    return segments or [{"type": "text", "data": {"text": text}}]
+
+
+def _embed_remote_images(segments: list) -> list:
+    """把网络图片转成 OneBot 的 base64:// 数据，避免 QQ/NapCat 无法拉取外链。"""
+    for segment in segments:
+        if segment.get("type") != "image":
+            continue
+        data = segment.setdefault("data", {})
+        image_url = data.get("file", "")
+        if not image_url.lower().startswith(("http://", "https://")):
+            continue
+        try:
+            req = urllib.request.Request(image_url, headers={"User-Agent": _IMAGE_USER_AGENT})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                content_length = int(resp.headers.get("Content-Length", "0") or 0)
+                if content_length > _MAX_IMAGE_BYTES:
+                    raise ValueError(f"图片过大: {content_length} bytes")
+                image_bytes = resp.read(_MAX_IMAGE_BYTES + 1)
+            if len(image_bytes) > _MAX_IMAGE_BYTES:
+                raise ValueError(f"图片超过 {_MAX_IMAGE_BYTES // 1024 // 1024} MB")
+            if not image_bytes:
+                raise ValueError("图片内容为空")
+            data["file"] = "base64://" + base64.b64encode(image_bytes).decode("ascii")
+            print(f"[QQAdapter] 图片已下载并转为 Base64: {len(image_bytes)} bytes")
+        except Exception as e:
+            # 保留原 URL 作为降级方案，让 NapCat 再尝试一次直接拉取。
+            print(f"[QQAdapter] 图片下载失败，将尝试原 URL: {type(e).__name__}: {e}")
+    return segments
 
 
 def extract_text(message) -> str:
@@ -51,21 +137,35 @@ def _has_at(message, self_id: str) -> bool:
     return False
 
 
-def split_long_text(text: str, max_len: int = None) -> list:
-    """将长文本切分为多个片段，尽量在换行处切开。"""
-    if max_len is None:
-        max_len = QQ_MSG_MAX_LEN
+def _split_cq_safe(text: str, max_len: int) -> list:
+    """安全切分文本，不会切断 CQ 码。"""
     if len(text) <= max_len:
         return [text]
+
+    # 收集所有 CQ 码区间
+    cq_ranges = [(m.start(), m.end()) for m in _CQ_RE.finditer(text)]
 
     chunks = []
     remaining = text
     while len(remaining) > max_len:
+        # 优先在换行处切
         split_at = remaining.rfind("\n", 0, max_len)
         if split_at < max_len // 2:
             split_at = max_len
+
+        # 确保不切在 CQ 码中间
+        for start, end in cq_ranges:
+            if start < split_at < end:
+                split_at = start  # 退到 CQ 码之前
+                break
+
         chunks.append(remaining[:split_at])
         remaining = remaining[split_at:].lstrip("\n")
+
+        # 调整后续 CQ 码偏移
+        shift = split_at
+        cq_ranges = [(s - shift, e - shift) for (s, e) in cq_ranges if s >= shift]
+
     if remaining:
         chunks.append(remaining)
     return chunks
@@ -97,6 +197,11 @@ class QQAdapter:
         self._thread: threading.Thread | None = None
         self._running = False
         self._self_id: str = ""
+        self._retry_delay = 5
+        self._pending_actions = {}
+        self._pending_lock = threading.Lock()
+        self._sent_message_ids = deque(maxlen=500)
+        self._sent_ids_lock = threading.Lock()
 
         # 回调
         self._group_message_handlers = []
@@ -157,6 +262,29 @@ class QQAdapter:
         except Exception as e:
             print(f"[QQAdapter] WS 发送失败: {e}")
 
+    def _ws_send_wait(self, payload: dict, timeout: float = 20) -> dict:
+        """通过 WebSocket 发送 action，并等待 NapCat 返回同 echo 的真实结果。"""
+        ws = self._ws
+        if ws is None:
+            return {"status": "failed", "retcode": -1, "msg": "WebSocket 未连接"}
+
+        echo = f"qqbot_{uuid.uuid4().hex}"
+        waiter = {"event": threading.Event(), "result": None}
+        payload = dict(payload)
+        payload["echo"] = echo
+        with self._pending_lock:
+            self._pending_actions[echo] = waiter
+        try:
+            ws.send(json.dumps(payload, ensure_ascii=False))
+            if not waiter["event"].wait(timeout):
+                return {"status": "failed", "retcode": -1, "msg": f"等待 NapCat 回执超时（{timeout} 秒）"}
+            return waiter["result"] or {"status": "failed", "retcode": -1, "msg": "NapCat 返回空回执"}
+        except Exception as e:
+            return {"status": "failed", "retcode": -1, "msg": str(e)}
+        finally:
+            with self._pending_lock:
+                self._pending_actions.pop(echo, None)
+
     def _http_post(self, action: str, params: dict) -> dict:
         """通过 HTTP API 调用 OneBot action。"""
         url = f"{self.http_url}/{action}"
@@ -176,32 +304,57 @@ class QQAdapter:
             return {"status": "failed", "retcode": -1, "msg": str(e)}
 
     def send_group_msg(self, group_id: int, text: str):
-        """向群发送消息，超长自动分段。"""
-        for chunk in split_long_text(text):
+        """向群发送消息，超长自动分段。支持 CQ 码转义。"""
+        for chunk in _split_cq_safe(text, QQ_MSG_MAX_LEN):
+            message = _parse_to_segments(chunk)
+            has_image = any(seg.get("type") == "image" for seg in message)
+            if has_image:
+                message = _embed_remote_images(message)
             payload = {
                 "action": "send_group_msg",
                 "params": {
                     "group_id": group_id,
-                    "message": [{"type": "text", "data": {"text": chunk}}],
+                    "message": message,
                 },
             }
-            print(f"[QQAdapter] WS发送: action=send_group_msg group={group_id} len={len(chunk)}")
-            self._ws_send(payload)
+            result = self._ws_send_wait(payload)
+            if result.get("status") == "ok" and result.get("retcode", 0) == 0:
+                message_id = (result.get("data") or {}).get("message_id", "")
+                if message_id != "":
+                    with self._sent_ids_lock:
+                        self._sent_message_ids.append(str(message_id))
+                if has_image:
+                    print(f"[QQAdapter] QQ图片发送成功: group={group_id} message_id={(result.get('data') or {}).get('message_id', '')}")
+                else:
+                    print(f"[QQAdapter] QQ消息发送成功: group={group_id} message_id={message_id}")
+            else:
+                print(f"[QQAdapter] QQ{'图片' if has_image else '消息'}发送失败: group={group_id} response={result}")
             if len(chunk) > QQ_MSG_MAX_LEN // 2:
                 time.sleep(0.3)
 
     def send_private_msg(self, user_id: int, text: str):
-        """向用户发送私聊消息。"""
-        for chunk in split_long_text(text):
+        """向用户发送私聊消息。支持 CQ 码转义。"""
+        for chunk in _split_cq_safe(text, QQ_MSG_MAX_LEN):
+            message = _parse_to_segments(chunk)
+            has_image = any(seg.get("type") == "image" for seg in message)
+            if has_image:
+                message = _embed_remote_images(message)
             payload = {
                 "action": "send_private_msg",
                 "params": {
                     "user_id": user_id,
-                    "message": [{"type": "text", "data": {"text": chunk}}],
+                    "message": message,
                 },
             }
-            print(f"[QQAdapter] WS发送: action=send_private_msg user={user_id} len={len(chunk)}")
-            self._ws_send(payload)
+            if has_image:
+                result = self._ws_send_wait(payload)
+                if result.get("status") == "ok" and result.get("retcode", 0) == 0:
+                    print(f"[QQAdapter] QQ图片发送成功: user={user_id} message_id={(result.get('data') or {}).get('message_id', '')}")
+                else:
+                    print(f"[QQAdapter] QQ图片发送失败: user={user_id} response={result}")
+            else:
+                print(f"[QQAdapter] WS发送: action=send_private_msg user={user_id} len={len(chunk)} segs={len(message)}")
+                self._ws_send(payload)
             if len(chunk) > QQ_MSG_MAX_LEN // 2:
                 time.sleep(0.3)
 
@@ -239,16 +392,31 @@ class QQAdapter:
             except Exception as e:
                 print(f"[QQAdapter] WebSocket 异常: {e}")
             if self._running:
-                print("[QQAdapter] 5 秒后重连…")
-                time.sleep(5)
+                print(
+                    f"[QQAdapter] NapCat 未连接（{self.ws_url}）。"
+                    f"请先启动 NapCat 并启用 OneBot WebSocket，{self._retry_delay} 秒后重试…"
+                )
+                time.sleep(self._retry_delay)
+                self._retry_delay = min(self._retry_delay * 2, 30)
 
     def _on_open(self, ws):
+        self._retry_delay = 5
         print(f"[QQAdapter] 已连接: {self.ws_url}")
 
     def _on_message(self, ws, raw: str):
         try:
             event = json.loads(raw)
         except json.JSONDecodeError:
+            return
+
+        # OneBot action 回执没有 post_type，通过 echo 交还给等待发送结果的线程。
+        echo = event.get("echo")
+        if echo:
+            with self._pending_lock:
+                waiter = self._pending_actions.get(str(echo))
+            if waiter:
+                waiter["result"] = event
+                waiter["event"].set()
             return
 
         post_type = event.get("post_type", "")
@@ -311,4 +479,23 @@ class QQAdapter:
         raw = event.get("raw_message", "")
         if raw and f"[CQ:at,qq={self._self_id}]" in raw:
             return True
+        return False
+
+    def is_reply_to_bot(self, event: dict) -> bool:
+        """判断消息是否引用回复了机器人最近发送的消息。"""
+        message = event.get("message", [])
+        if not isinstance(message, list):
+            return False
+        with self._sent_ids_lock:
+            sent_ids = set(self._sent_message_ids)
+        for segment in message:
+            if segment.get("type") != "reply":
+                continue
+            data = segment.get("data", {})
+            reply_user = str(data.get("qq") or data.get("user_id") or data.get("sender_id") or "")
+            if reply_user and reply_user == str(self._self_id):
+                return True
+            reply_id = str(data.get("id", ""))
+            if reply_id and reply_id in sent_ids:
+                return True
         return False
