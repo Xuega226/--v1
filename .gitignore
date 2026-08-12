@@ -18,3 +18,28 @@ venv/
 
 # Gradio / temp
 *.log
+qq_sessions/
+qq_workspace/embedding_models/
+qq_workspace/vision_cache/
+.downloads/
+ocr_build.*.log
+ollama_pull.*.log
+ollama_mirror_pull.*.log
+ollama_proxy_pull.*.log
+qwen_pull*.log
+
+# Local runtimes, models, build output, and Codex backups
+.dotnet/
+GPT-SoVITS/
+whisper_models/
+.codex_backups/
+desktop_agent/**/bin/
+desktop_agent/**/obj/
+
+# Runtime state and user-generated/private workspaces
+agent_sessions/
+agent_workspace/
+wechat_sessions/
+tts_output/
+test_tts.mp3
+qq_workspace/

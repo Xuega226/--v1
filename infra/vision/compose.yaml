@@ -1,0 +1,19 @@
+services:
+  paddleocr:
+    build:
+      context: ./paddleocr
+    container_name: unnameko-paddleocr
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8088:8088"
+    environment:
+      PADDLE_PDX_MODEL_SOURCE: BOS
+    volumes:
+      - paddleocr_models:/root/.paddlex
+      - paddleocr_cache:/root/.cache
+
+volumes:
+  paddleocr_models:
+    name: unnameko_paddleocr_models
+  paddleocr_cache:
+    name: unnameko_paddleocr_cache
