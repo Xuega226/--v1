@@ -49,6 +49,18 @@ class QQOutboxTests(unittest.TestCase):
         self.assertEqual("m-1", record["napcat_message_id"])
         self.assertEqual(1, manager.status(self.noon + 1)["sent_today"])
 
+    def test_duplicate_candidate_remains_a_real_persisted_record(self):
+        manager = self.manager()
+        first, _ = manager.enqueue(
+            kind="care", content="主人，今天还顺利吗？", dedupe_key="care:same", now=self.noon
+        )
+        duplicate, created = manager.enqueue(
+            kind="care", content="重复生成的文本", dedupe_key="care:same", now=self.noon + 1
+        )
+        self.assertFalse(created)
+        self.assertEqual(first["outbox_id"], duplicate["outbox_id"])
+        self.assertTrue(duplicate)
+
     def test_restart_turns_inflight_send_into_uncertain_without_retry(self):
         manager = self.manager()
         item, _ = manager.enqueue(

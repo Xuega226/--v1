@@ -1874,7 +1874,10 @@ def send_proactive_owner_message(
         return False
     if behaviors and behavior_plan:
         behaviors.complete(behavior_plan.plan_id, True, detail="已进入可靠发件箱")
-    return accepted
+    # A duplicate means the same real-world item is already safely queued; treat
+    # that as a successful hand-off so the candidate scheduler advances instead
+    # of regenerating text on every check.
+    return bool(_record) if not accepted else True
 
 
 def main():
