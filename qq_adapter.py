@@ -328,7 +328,9 @@ class QQAdapter:
     @property
     def connected(self) -> bool:
         """WebSocket 是否已连接。"""
-        return self._ws is not None and self._running
+        ws = self._ws
+        sock = getattr(ws, "sock", None) if ws is not None else None
+        return bool(self._running and sock is not None and getattr(sock, "connected", False))
 
     # ── 生命周期 ──────────────────────────────────────────
 
@@ -460,6 +462,56 @@ class QQAdapter:
                 self._ws_send(payload)
             if len(chunk) > QQ_MSG_MAX_LEN // 2:
                 time.sleep(0.3)
+
+    def send_private_msg_reliable(self, user_id: int, text: str) -> dict:
+        """Send one proactive DM and wait for the real OneBot acknowledgement.
+
+        The caller uses ``uncertain`` to decide whether retrying could duplicate a
+        message. Proactive messages are deliberately limited to one short chunk.
+        """
+        chunks = _split_cq_safe(str(text or ""), QQ_MSG_MAX_LEN)
+        if len(chunks) != 1:
+            return {
+                "ok": False,
+                "uncertain": False,
+                "message_id": "",
+                "error": "可靠主动私聊只允许一段短消息",
+            }
+        message = _parse_to_segments(chunks[0])
+        has_image = any(seg.get("type") == "image" for seg in message)
+        if has_image:
+            return {
+                "ok": False,
+                "uncertain": False,
+                "message_id": "",
+                "error": "QQ 主动沟通能力卡暂不允许发送图片",
+            }
+        if not self.connected:
+            return {
+                "ok": False,
+                "uncertain": False,
+                "message_id": "",
+                "error": "WebSocket 未连接",
+            }
+        result = self._ws_send_wait({
+            "action": "send_private_msg",
+            "params": {"user_id": int(user_id), "message": message},
+        })
+        ok = result.get("status") == "ok" and result.get("retcode", 0) == 0
+        if ok:
+            message_id = str((result.get("data") or {}).get("message_id", "") or "")
+            if message_id:
+                with self._sent_ids_lock:
+                    self._sent_message_ids.append(message_id)
+            print(f"[QQAdapter] 可靠私聊发送成功: user={user_id} message_id={message_id}")
+            return {"ok": True, "uncertain": False, "message_id": message_id, "error": ""}
+        error = str(result.get("message") or result.get("msg") or result)
+        # A timeout/transport exception can happen after NapCat accepted the send.
+        uncertain = any(token in error.lower() for token in (
+            "超时", "timeout", "closed", "broken", "connection", "连接", "reset",
+        )) and "未连接" not in error
+        print(f"[QQAdapter] 可靠私聊发送失败: user={user_id} uncertain={uncertain} response={result}")
+        return {"ok": False, "uncertain": uncertain, "message_id": "", "error": error[:500]}
 
     def send_qzone_msg(
         self,

@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 from qq_adapter import QQAdapter
 
@@ -30,6 +31,29 @@ class QzoneAdapterTests(unittest.TestCase):
         self.assertFalse(adapter.send_qzone_msg("正文", [], 16, [])["ok"])
         self.assertTrue(adapter.delete_qzone_msg("tid-1")["ok"])
         self.assertEqual(calls[0]["action"], "delete_qzone_msg")
+
+    def test_reliable_private_message_waits_for_ack_and_classifies_timeout(self):
+        adapter = QQAdapter()
+        adapter._running = True
+        adapter._ws = SimpleNamespace(sock=SimpleNamespace(connected=True))
+        adapter._ws_send_wait = lambda payload: {
+            "status": "ok", "retcode": 0, "data": {"message_id": 123}
+        }
+        receipt = adapter.send_private_msg_reliable(10001, "主人，我来啦。")
+        self.assertTrue(receipt["ok"])
+        self.assertEqual("123", receipt["message_id"])
+
+        adapter._ws_send_wait = lambda payload: {
+            "status": "failed", "retcode": -1, "msg": "等待 NapCat 回执超时（20 秒）"
+        }
+        receipt = adapter.send_private_msg_reliable(10001, "主人，还在吗？")
+        self.assertFalse(receipt["ok"])
+        self.assertTrue(receipt["uncertain"])
+
+        adapter._ws = None
+        receipt = adapter.send_private_msg_reliable(10001, "离线不发送")
+        self.assertFalse(receipt["ok"])
+        self.assertFalse(receipt["uncertain"])
 
 
 if __name__ == "__main__":

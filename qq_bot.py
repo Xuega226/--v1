@@ -17,6 +17,7 @@ import re
 import signal
 import json
 import time
+from copy import deepcopy
 from config import (
     DEEPSEEK_API_KEY, QQ_WORKSPACE_DIR, QQ_BOT_CREATOR_ID, QQ_BOT_PERSIST_DIR,
     QQ_BOT_NAME, QQ_RISK_ENABLED, QQ_RISK_THRESHOLD, QQ_RISK_FILE,
@@ -28,6 +29,9 @@ from config import (
     QQ_PROACTIVE_DM_DAILY_MAX, QQ_PROACTIVE_DM_MIN_IDLE, QQ_PROACTIVE_DM_MAX_IDLE,
     QQ_PROACTIVE_DM_UNANSWERED_GAP, QQ_PROACTIVE_DM_QUIET_START,
     QQ_PROACTIVE_DM_QUIET_END,
+    QQ_PROACTIVE_OUTBOX_FILE, QQ_PROACTIVE_OUTBOX_CHECK_INTERVAL,
+    QQ_PROACTIVE_OUTBOX_DAILY_MAX, QQ_PROACTIVE_OUTBOX_MIN_GAP,
+    QQ_PROACTIVE_AUTONOMY_MIN_VALUE,
     QQ_QZONE_ENABLED, QQ_QZONE_FILE, QQ_QZONE_MODE, QQ_QZONE_VISIBILITY,
     QQ_QZONE_CHECK_INTERVAL, QQ_QZONE_DAILY_MAX, QQ_QZONE_WEEKLY_MAX,
     QQ_QZONE_MIN_GAP, QQ_QZONE_QUIET_START, QQ_QZONE_QUIET_END,
@@ -37,6 +41,7 @@ from config import (
     QQ_MEMORY_MAINTENANCE_INTERVAL, QQ_MEMORY_CANDIDATE_DAYS, QQ_MEMORY_EXPORT_DIR,
     QQ_BEHAVIOR_ENABLED, QQ_BEHAVIOR_FILE, QQ_BEHAVIOR_MODE,
     QQ_BEHAVIOR_OUTBOUND_MIN_GAP, QQ_BEHAVIOR_HISTORY_LIMIT,
+    DESKTOP_AGENT_RUNTIME_DB, DESKTOP_AGENT_AUTONOMY_FILE,
     WORLD_BOOK_ENABLED, WORLD_BOOK_DIR, WORLD_BOOK_DB, WORLD_BOOK_QDRANT_URL,
     WORLD_BOOK_QDRANT_COLLECTION, WORLD_BOOK_EMBED_MODEL, WORLD_BOOK_EMBED_DEVICE,
     WORLD_BOOK_MODEL_CACHE,
@@ -55,6 +60,7 @@ from daily_state import DailyStateManager
 from llm import chat_completion
 from memory_lifecycle import MemoryLifecycleManager
 from proactive_manager import ProactiveCandidate, ProactiveManager
+from qq_outbox import QQEventCollector, QQOutbox
 from qzone_manager import QzoneCandidate, QzoneManager
 from qq_adapter import QQAdapter, extract_image_segments, extract_reply_id
 from risk_manager import RiskManager
@@ -1362,6 +1368,7 @@ def handle_private_message(
     visions: VisionManager,
     social: SocialStateManager | None = None,
     proactive: ProactiveManager | None = None,
+    outbox: QQOutbox | None = None,
     qzone: QzoneManager | None = None,
     life: DailyStateManager | None = None,
     ledger: ActivityLedger | None = None,
@@ -1383,6 +1390,15 @@ def handle_private_message(
 
     if is_creator and proactive:
         proactive.note_owner_activity()
+
+    if is_creator and outbox:
+        control_response = outbox.observe_owner_message(text)
+        if control_response:
+            adapter.send_private_msg(user_id, control_response)
+            return
+        if text in ("/qqsend", "/qqsend status"):
+            adapter.send_private_msg(user_id, outbox.format_status())
+            return
 
     if handle_behavior_command(
         user_id,
@@ -1444,9 +1460,12 @@ def handle_private_message(
                 f"下次候选时间：{next_text}\n"
                 f"连续未回应：{status['ignored_count']} 次",
             )
+            adapter.send_private_msg(user_id, outbox.format_status() if outbox else "可靠发件箱未初始化")
             return
         if action in ("on", "off"):
             proactive.set_enabled(action == "on")
+            if outbox:
+                outbox.observe_owner_message(f"/qqsend {action}")
             adapter.send_private_msg(user_id, f"主动私聊已{'开启' if action == 'on' else '关闭'}喵~")
             return
         if action == "frequency" and len(parts) == 3:
@@ -1465,12 +1484,24 @@ def handle_private_message(
             sent, reason = proactive.trigger_now()
             if not sent:
                 adapter.send_private_msg(user_id, f"暂时没有发出主动消息：{reason}。")
+            elif outbox:
+                delivered, dispatch_reason, _record = outbox.tick()
+                if not delivered:
+                    adapter.send_private_msg(user_id, f"消息已进入可靠发件箱：{dispatch_reason}。")
             return
         adapter.send_private_msg(
             user_id,
             "用法：/proactive status|on|off|now\n"
             "/proactive frequency low|normal|high\n"
             "/proactive quiet HH:MM HH:MM",
+        )
+        return
+
+    if is_creator and text.startswith("/qqsend"):
+        adapter.send_private_msg(
+            user_id,
+            "用法：/qqsend status|on|off|less|more|resume\n"
+            "/qqsend busy [小时]\n/qqsend cancel <消息ID前缀>",
         )
         return
 
@@ -1625,6 +1656,10 @@ def handle_private_message(
         agent_input = f"{life.context()}\n\n{agent_input}"
     if behavior_plan and behavior_plan.prompt:
         agent_input = f"{behavior_plan.prompt}\n\n{agent_input}"
+    if is_creator and outbox:
+        reference_prompt = outbox.reference_prompt(text)
+        if reference_prompt:
+            agent_input = f"{reference_prompt}\n\n{agent_input}"
 
     try:
         with sessions.session_lock(session_key):
@@ -1745,9 +1780,10 @@ def send_proactive_owner_message(
     ledger: ActivityLedger | None = None,
     memory: MemoryLifecycleManager | None = None,
     behaviors: BehaviorPlanner | None = None,
+    outbox: QQOutbox | None = None,
 ) -> bool:
-    """Generate exactly one short owner DM after the local scheduler approves it."""
-    if not QQ_BOT_CREATOR_ID or not adapter.connected:
+    """Render one persona-consistent care candidate and persist it in the outbox."""
+    if not QQ_BOT_CREATOR_ID or outbox is None:
         return False
 
     session_key = f"private_{QQ_BOT_CREATOR_ID}"
@@ -1801,9 +1837,13 @@ def send_proactive_owner_message(
     history_message = "【未名子主动联系主人】"
     try:
         with sessions.session_lock(session_key):
-            result = agent.run_cli(user_input=prompt, history_input=history_message)
-            result = _FACE_RE.sub("", result).strip()
-            sessions.save(session_key)
+            previous_messages = deepcopy(agent.messages)
+            try:
+                result = agent.run_cli(user_input=prompt, history_input=history_message)
+                result = _FACE_RE.sub("", result).strip()
+            finally:
+                # The draft is not conversation history until NapCat acknowledges it.
+                agent.messages = previous_messages
     except Exception as exc:
         print(f"[Proactive] 生成主动消息失败: {type(exc).__name__}: {exc}")
         result = ""
@@ -1814,43 +1854,27 @@ def send_proactive_owner_message(
             if candidate.follow_up
             else "主人，刚刚忽然想起你了，今天过得还顺利吗？"
         )
+    dedupe_source = candidate.follow_up_id or f"idle:{int(time.time() // 3600)}"
     try:
-        adapter.send_private_msg(int(QQ_BOT_CREATOR_ID), result)
+        _record, accepted = outbox.enqueue(
+            kind="care",
+            content=result,
+            dedupe_key=f"care:{dedupe_source}",
+            context={
+                "follow_up_id": candidate.follow_up_id,
+                "reason": candidate.follow_up or "主人已经一段时间没有出现",
+                "evidence": [f"候选类型={candidate.reason}", f"当前心情={candidate.mood}"],
+                "expected_reply": "主人可以回应近况，也可以暂时不回复",
+            },
+        )
     except Exception as exc:
         if behaviors and behavior_plan:
             behaviors.complete(behavior_plan.plan_id, False, detail=type(exc).__name__)
-        print(f"[Proactive] QQ 发送失败: {type(exc).__name__}: {exc}")
+        print(f"[Proactive] 主动消息入队失败: {type(exc).__name__}: {exc}")
         return False
     if behaviors and behavior_plan:
-        behaviors.complete(behavior_plan.plan_id, True)
-    social.record_reply(
-        session_key,
-        QQ_BOT_CREATOR_ID,
-        result,
-        proactive=True,
-    )
-    if life:
-        life.observe_event("proactive_sent", is_owner=True, significance=0.65, valence=0.2)
-    if ledger:
-        ledger.record(
-            kind="qq.proactive_sent",
-            summary="主动给主人发送了一条私聊消息",
-            actor_scope="self",
-            privacy="relationship",
-            verified=True,
-            source="proactive_manager",
-            significance=0.6,
-            emotional_valence=0.18,
-        )
-    if memory:
-        memory.capture_assistant_commitment(
-            subject_id=QQ_BOT_CREATOR_ID,
-            response=result,
-            scope_id=session_key,
-        )
-    if candidate.follow_up_id:
-        social.mark_follow_up_prompted(QQ_BOT_CREATOR_ID, candidate.follow_up_id)
-    return True
+        behaviors.complete(behavior_plan.plan_id, True, detail="已进入可靠发件箱")
+    return accepted
 
 
 def main():
@@ -1957,6 +1981,22 @@ def main():
         quiet_start=QQ_PROACTIVE_DM_QUIET_START,
         quiet_end=QQ_PROACTIVE_DM_QUIET_END,
     )
+    outbox = QQOutbox(
+        path=QQ_PROACTIVE_OUTBOX_FILE,
+        owner_id=QQ_BOT_CREATOR_ID,
+        enabled=QQ_PROACTIVE_DM_ENABLED,
+        daily_max=QQ_PROACTIVE_OUTBOX_DAILY_MAX,
+        min_gap=QQ_PROACTIVE_OUTBOX_MIN_GAP,
+        quiet_start=QQ_PROACTIVE_DM_QUIET_START,
+        quiet_end=QQ_PROACTIVE_DM_QUIET_END,
+        check_interval=QQ_PROACTIVE_OUTBOX_CHECK_INTERVAL,
+    )
+    event_collector = QQEventCollector(
+        outbox,
+        DESKTOP_AGENT_RUNTIME_DB,
+        DESKTOP_AGENT_AUTONOMY_FILE,
+        autonomy_min_value=QQ_PROACTIVE_AUTONOMY_MIN_VALUE,
+    )
     qzone = QzoneManager(
         path=QQ_QZONE_FILE,
         owner_id=QQ_BOT_CREATOR_ID,
@@ -2003,7 +2043,7 @@ def main():
         handle_private_message(
             user_id, text, raw_event,
             adapter=adapter, sessions=sessions, worldbooks=worldbooks, visions=visions,
-            social=social, proactive=proactive, qzone=qzone,
+            social=social, proactive=proactive, outbox=outbox, qzone=qzone,
             life=life, ledger=ledger, memory=memory, behaviors=behaviors, debug=debug,
         )
 
@@ -2036,8 +2076,58 @@ def main():
             ledger=ledger,
             memory=memory,
             behaviors=behaviors,
+            outbox=outbox,
         ),
         lambda: social.get_proactive_context(QQ_BOT_CREATOR_ID),
+    )
+
+    def settle_proactive_dm(record: dict):
+        content = str(record.get("content", ""))
+        context = record.get("context", {}) or {}
+        session_key = f"private_{QQ_BOT_CREATOR_ID}"
+        with sessions.session_lock(session_key):
+            owner_agent = sessions.get(session_key)
+            owner_agent.messages.append({"role": "assistant", "content": content})
+            sessions.save(session_key)
+        social.record_reply(session_key, QQ_BOT_CREATOR_ID, content, proactive=True)
+        follow_up_id = str(context.get("follow_up_id", "") or "")
+        if follow_up_id:
+            social.mark_follow_up_prompted(QQ_BOT_CREATOR_ID, follow_up_id)
+        life.observe_event("proactive_sent", is_owner=True, significance=0.65, valence=0.2)
+        ledger.record(
+            kind="qq.proactive_sent",
+            summary=f"主动给主人发送了一条{record.get('kind', '消息')}",
+            actor_scope="self",
+            details={
+                "outbox_id": record.get("outbox_id", ""),
+                "message_id": record.get("napcat_message_id", ""),
+                "context": context,
+            },
+            privacy="relationship",
+            verified=True,
+            source="qq_reliable_outbox",
+            significance=0.65,
+            emotional_valence=0.18,
+            event_id=f"qq:outbox:{record.get('outbox_id', '')}",
+        )
+        memory.capture_assistant_commitment(
+            subject_id=QQ_BOT_CREATOR_ID,
+            response=content,
+            scope_id=session_key,
+        )
+        behaviors.record_external_action(
+            "private_reply",
+            reason=f"qq_outbox_{record.get('kind', 'message')}",
+            success=True,
+        )
+
+    outbox.start(
+        lambda record: adapter.send_private_msg_reliable(
+            int(QQ_BOT_CREATOR_ID), str(record.get("content", ""))
+        ),
+        lambda: adapter.connected,
+        collector=event_collector.collect,
+        on_ack=settle_proactive_dm,
     )
 
     def qzone_draft_callback(candidate: QzoneCandidate) -> str:
@@ -2170,6 +2260,13 @@ def main():
         f"频率 {proactive_status['frequency']}；"
         f"勿扰 {proactive_status['quiet_start']}～{proactive_status['quiet_end']}"
     )
+    outbox_status = outbox.status()
+    print(
+        f"   QQ 可靠发件箱: {'授权' if outbox_status['grant']['active'] else '未授权'}；"
+        f"今日 {outbox_status['sent_today']}/{outbox_status['grant']['daily_max']}；"
+        f"待发送 {outbox_status['counts'].get('candidate', 0) + outbox_status['counts'].get('retry_wait', 0)}；"
+        f"结果不确定 {outbox_status['counts'].get('uncertain', 0)}"
+    )
     qzone_status = qzone.status()
     print(
         f"   空间动态: {'启用' if qzone_status['enabled'] else '关闭'}；"
@@ -2204,6 +2301,7 @@ def main():
         )
         qzone.stop()
         proactive.stop()
+        outbox.stop()
         life.stop()
         memory.stop()
         adapter.stop()
